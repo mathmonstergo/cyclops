@@ -35,8 +35,14 @@ def load_faq_rows(path: str | Path) -> list[dict[str, Any]]:
 
 
 def import_faqs(path: str | Path, db: Any, embeddings: Any) -> int:
+    """导入 FAQ 并原子写入 ready 投影，关键约束是显式记录当前 embedding 模型和维度。"""
     rows = load_faq_rows(path)
     for row in rows:
         vector = embeddings.embed(row["embedding_text"])
-        db.upsert_faq(row, vector)
+        db.upsert_faq(
+            row,
+            vector,
+            embedding_model=embeddings.model,
+            embedding_dimensions=embeddings.dimensions,
+        )
     return len(rows)

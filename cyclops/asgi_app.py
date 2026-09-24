@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import os
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable
 from urllib.parse import quote
 
 import uvicorn
@@ -16,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cyclops.admin_server import (
     AdminApp,
+    AdminConflictError,
     AdminNotFoundError,
     AdminPayloadTooLargeError,
     AdminValidationError,
@@ -29,6 +31,8 @@ from cyclops.admin_server import (
     static_path,
 )
 from cyclops.config import Settings
+from cyclops.import_parse_worker import ImportParseWorker
+from cyclops.kg_extraction_worker import KgExtractionWorker
 
 
 def create_app(
@@ -36,8 +40,10 @@ def create_app(
     settings: Settings | None = None,
     admin_app: Any | None = None,
     init_schema: bool = False,
+    worker_factory: Callable[[Any], ImportParseWorker] | None = None,
+    kg_worker_factory: Callable[[Any], KgExtractionWorker] | None = None,
 ) -> FastAPI:
-    """创建 Cyclops ASGI app；关键约束是路由层复用 AdminApp 业务方法。"""
+    """创建 ASGI app，并在同一 lifespan 启停两个持久后台 worker。"""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -49,10 +55,26 @@ def create_app(
             app.state.admin_app = AdminApp(loaded_settings)
             if init_schema:
                 app.state.admin_app.database().init_schema()
+        factory = worker_factory or _create_import_parse_worker
+        import_worker = factory(app.state.admin_app)
+        kg_factory = kg_worker_factory or _create_kg_extraction_worker
+        kg_worker = kg_factory(app.state.admin_app)
+        app.state.import_parse_worker = import_worker
+        app.state.kg_extraction_worker = kg_worker
+        import_worker_task = asyncio.create_task(import_worker.run())
+        kg_worker_task = asyncio.create_task(kg_worker.run())
         try:
             yield
         finally:
-            _close_admin_resources(app.state.admin_app)
+            import_worker.stop()
+            kg_worker.stop()
+            try:
+                await import_worker_task
+            finally:
+                try:
+                    await kg_worker_task
+                finally:
+                    _close_admin_resources(app.state.admin_app)
 
     app = FastAPI(title="Cyclops", lifespan=lifespan)
     if admin_app is not None:
@@ -61,6 +83,26 @@ def create_app(
     _register_routes(app)
     _mount_static_dist(app)
     return app
+
+
+def _create_import_parse_worker(admin_app: Any) -> ImportParseWorker:
+    """按当前 Settings 构造唯一 worker，避免路由层复制生命周期配置。"""
+    return ImportParseWorker(
+        admin_app,
+        poll_interval_seconds=(
+            admin_app.settings.import_parse_worker_poll_interval_seconds
+        ),
+        lease_seconds=admin_app.settings.import_parse_worker_lease_seconds,
+    )
+
+
+def _create_kg_extraction_worker(admin_app: Any) -> KgExtractionWorker:
+    """按当前 Settings 构造 KG worker，确保服务重启可恢复 active job。"""
+    return KgExtractionWorker(
+        admin_app,
+        poll_interval_seconds=admin_app.settings.kg_extraction_worker_poll_seconds,
+        lease_seconds=admin_app.settings.kg_extraction_worker_lease_seconds,
+    )
 
 
 def run_admin_asgi(settings: Settings, *, host: str, port: int) -> None:
@@ -72,7 +114,7 @@ def run_admin_asgi(settings: Settings, *, host: str, port: int) -> None:
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
-    """注册统一异常响应；关键约束是沿用旧 admin_server.py 的错误结构。"""
+    """注册统一异常响应；关键约束是只输出 AdminApp 分类后的当前错误结构。"""
 
     async def handle_exception(_request: Request, exc: Exception) -> JSONResponse:
         """统一处理未捕获异常；关键约束是 500 响应不泄漏内部细节。"""
@@ -82,6 +124,7 @@ def _register_exception_handlers(app: FastAPI) -> None:
     for exc_type in (
         AdminValidationError,
         AdminNotFoundError,
+        AdminConflictError,
         AdminPayloadTooLargeError,
         AiSuggestionError,
         ImportCandidateError,
@@ -91,7 +134,7 @@ def _register_exception_handlers(app: FastAPI) -> None:
 
 
 def _register_routes(app: FastAPI) -> None:
-    """注册所有管理后台路由；关键约束是路径兼容现有 React 前端。"""
+    """注册所有管理后台路由；关键约束是路径与当前 React 客户端契约一致。"""
 
     @app.get("/favicon.ico")
     def favicon() -> Response:
@@ -110,12 +153,12 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/settings")
     async def update_settings(request: Request) -> Any:
-        """保存设置；关键约束是 JSON body 必须保持旧接口对象形状。"""
+        """保存设置；关键约束是 JSON body 必须使用当前对象契约。"""
         return _admin(request).update_settings(await _read_json(request))
 
     @app.get("/api/retrieval/eval-cases")
     def list_retrieval_eval_cases(request: Request) -> Any:
-        """列出检索评测用例；关键约束是 query 参数兼容 parse_qs。"""
+        """列出检索评测用例；关键约束是查询参数保持多值列表结构。"""
         return _admin(request).list_retrieval_eval_cases(_query_params(request))
 
     @app.post("/api/retrieval/eval-cases")
@@ -130,7 +173,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/retrieval/aliases")
     def list_retrieval_aliases(request: Request) -> Any:
-        """列出检索别名；关键约束是路径不变以兼容前端。"""
+        """列出检索别名；关键约束是使用当前前端调用的固定路径。"""
         return _admin(request).list_retrieval_aliases()
 
     @app.post("/api/retrieval/aliases")
@@ -140,12 +183,12 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/kg/entities")
     def list_kg_entities(request: Request) -> Any:
-        """列出 KG 实体；关键约束是保留状态和类型筛选参数。"""
+        """列出 KG 实体；关键约束是状态和类型筛选均走当前审核契约。"""
         return _admin(request).list_kg_entities(_query_params(request))
 
     @app.get("/api/kg/relations")
     def list_kg_relations(request: Request) -> Any:
-        """列出 KG 关系；关键约束是保留审核列表响应结构。"""
+        """列出 KG 关系；关键约束是返回当前审核列表所需的端点与证据。"""
         return _admin(request).list_kg_relations(_query_params(request))
 
     @app.get("/api/kg/subgraph")
@@ -153,15 +196,41 @@ def _register_routes(app: FastAPI) -> None:
         """读取 KG 子图；关键约束是只通过显式调试接口暴露。"""
         return _admin(request).kg_subgraph(_query_params(request))
 
-    @app.post("/api/kg/extraction-jobs")
-    async def create_kg_extraction_job(request: Request) -> Any:
-        """创建 KG 抽取任务；关键约束是候选仍默认待审核。"""
-        return _admin(request).create_kg_extraction_job(await _read_json(request))
+    @app.get("/api/kg/extraction-jobs/{job_id}")
+    def get_kg_extraction_job(job_id: str, request: Request) -> Any:
+        """读取 KG 抽取任务状态，供前端轮询 completed 或 failed。"""
+        return _admin(request).get_kg_extraction_job(job_id)
+
+    @app.post("/api/faqs/{faq_id}/kg-extraction-jobs")
+    async def queue_faq_kg_extraction_job(faq_id: str, request: Request) -> Any:
+        """创建 FAQ queued 任务；关键约束是请求不会执行模型。"""
+        return _admin(request).queue_faq_kg_extraction_job(
+            faq_id,
+            await _read_empty_json(request),
+        )
+
+    @app.get("/api/faqs/{faq_id}/kg-extraction-jobs/latest")
+    def get_latest_faq_kg_extraction_job(faq_id: str, request: Request) -> Any:
+        """读取 FAQ 最近任务；关键约束是只返回持久化公开 DTO。"""
+        return _admin(request).get_latest_faq_kg_extraction_job(faq_id)
+
+    @app.post("/api/import/files/{file_id}/kg-extraction-jobs")
+    async def queue_document_kg_extraction_job(file_id: str, request: Request) -> Any:
+        """创建整篇文档 queued 父任务；切片 Map 由持久 worker 推进。"""
+        return _admin(request).queue_document_kg_extraction_job(
+            file_id,
+            await _read_empty_json(request),
+        )
+
+    @app.get("/api/import/files/{file_id}/kg-extraction-jobs/latest")
+    def get_latest_document_kg_extraction_job(file_id: str, request: Request) -> Any:
+        """读取文档最近父任务；关键约束是不接受单切片 ID。"""
+        return _admin(request).get_latest_document_kg_extraction_job(file_id)
 
     @app.post("/api/kg/entities/{entity_id}/confirm")
-    def confirm_kg_entity(entity_id: str, request: Request) -> Any:
-        """确认 KG 实体；关键约束是投影逻辑仍由数据库层处理。"""
-        return _admin(request).confirm_kg_entity(entity_id)
+    async def confirm_kg_entity(entity_id: str, request: Request) -> Any:
+        """确认 KG 实体；关键约束是显式读取调用方审核的 revision。"""
+        return _admin(request).confirm_kg_entity(entity_id, await _read_json(request))
 
     @app.post("/api/kg/entities/{entity_id}/status")
     async def set_kg_entity_status(entity_id: str, request: Request) -> Any:
@@ -169,9 +238,9 @@ def _register_routes(app: FastAPI) -> None:
         return _admin(request).set_kg_entity_status(entity_id, await _read_json(request))
 
     @app.post("/api/kg/relations/{relation_id}/confirm")
-    def confirm_kg_relation(relation_id: str, request: Request) -> Any:
-        """确认 KG 关系；关键约束是保持 relation_id 路径兼容。"""
-        return _admin(request).confirm_kg_relation(relation_id)
+    async def confirm_kg_relation(relation_id: str, request: Request) -> Any:
+        """确认 KG 关系；关键约束是显式读取调用方审核的 revision。"""
+        return _admin(request).confirm_kg_relation(relation_id, await _read_json(request))
 
     @app.post("/api/kg/relations/{relation_id}/status")
     async def set_kg_relation_status(relation_id: str, request: Request) -> Any:
@@ -180,7 +249,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/import/files")
     def list_import_files(request: Request) -> Any:
-        """列出导入文件；关键约束是筛选参数沿用旧后台格式。"""
+        """列出导入文件；关键约束是筛选参数使用当前列表契约。"""
         return _admin(request).list_import_files(_query_params(request))
 
     @app.post("/api/import/files")
@@ -204,6 +273,11 @@ def _register_routes(app: FastAPI) -> None:
         """删除导入文件；关键约束是文件与数据库清理由业务层完成。"""
         return _admin(request).delete_import_file(file_id)
 
+    @app.get("/api/import/files/{file_id}")
+    def get_import_file(file_id: str, request: Request) -> Any:
+        """读取文件与最新解析任务；关键约束是 GET 不推进 provider。"""
+        return _admin(request).get_import_file(file_id)
+
     @app.get("/api/import/files/{file_id}/download")
     def download_import_file(file_id: str, request: Request) -> FileResponse:
         """下载导入原件；关键约束是保留中文文件名编码。"""
@@ -219,27 +293,22 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/import/files/{file_id}/chunks")
     def list_import_chunks(file_id: str, request: Request) -> Any:
-        """列出文件切片；关键约束是响应结构兼容切片页面。"""
+        """列出文件切片；关键约束是响应使用切片页面的当前结构。"""
         return _admin(request).list_import_chunks(file_id)
 
-    @app.get("/api/import/files/{file_id}/parse-status")
-    def get_import_parse_status(file_id: str, request: Request) -> Any:
-        """读取解析状态；关键约束是兼容前端轮询。"""
-        return _admin(request).get_import_parse_status(file_id)
+    @app.get("/api/import/parse-jobs/{job_id}")
+    def get_import_parse_job(job_id: str, request: Request) -> Any:
+        """只读解析任务状态；关键约束是任务推进完全属于 lifespan worker。"""
+        return _admin(request).get_import_parse_job(job_id)
 
     @app.get("/api/import/files/{file_id}/candidates")
     def list_import_file_candidates(file_id: str, request: Request) -> Any:
         """列出文件候选 FAQ；关键约束是候选仍需人工审核。"""
         return _admin(request).list_import_file_candidates(file_id)
 
-    @app.post("/api/import/files/{file_id}/reparse")
-    async def reparse_import_file(file_id: str, request: Request) -> Any:
-        """重解析导入文件；关键约束是解析选项仍由 AdminApp 校验。"""
-        return _admin(request).reparse_import_file(file_id, await _read_json(request))
-
     @app.post("/api/import/files/{file_id}/parse-jobs")
     async def start_import_parse_job(file_id: str, request: Request) -> Any:
-        """启动解析任务；关键约束是外部解析状态仍可轮询。"""
+        """创建 queued 解析任务；关键约束是请求阶段不执行 provider。"""
         return _admin(request).start_import_parse_job(file_id, await _read_json(request))
 
     @app.post("/api/import/files/{file_id}/disabled")
@@ -259,12 +328,12 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/import/chunks/{chunk_id}/candidates")
     def list_import_candidates(chunk_id: str, request: Request) -> Any:
-        """列出切片候选 FAQ；关键约束是保留旧候选审核路径。"""
+        """列出切片候选 FAQ；关键约束是候选审核只使用当前路由。"""
         return _admin(request).list_import_candidates(chunk_id)
 
     @app.post("/api/import/chunks/{chunk_id}/generate")
     def generate_import_candidates(chunk_id: str, request: Request) -> Any:
-        """为单个切片生成候选 FAQ；关键约束是同步旧按钮行为。"""
+        """为单个切片生成候选 FAQ；关键约束是返回当前按钮所需的候选结果。"""
         return _admin(request).generate_import_candidates(chunk_id)
 
     @app.post("/api/import/chunks/{chunk_id}/disabled")
@@ -309,7 +378,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/faqs")
     def list_faqs(request: Request) -> Any:
-        """列出 FAQ；关键约束是 query 参数兼容旧表格筛选。"""
+        """列出 FAQ；关键约束是查询参数使用当前表格筛选结构。"""
         return _admin(request).list_faqs(_query_params(request))
 
     @app.post("/api/faqs")
@@ -329,7 +398,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/faqs/{faq_id}")
     def get_faq(faq_id: str, request: Request) -> Any:
-        """读取单条 FAQ；关键约束是路径参数保持旧 API。"""
+        """读取单条 FAQ；关键约束是 faq_id 为当前唯一定位字段。"""
         return _admin(request).get_faq(faq_id)
 
     @app.post("/api/faqs/{faq_id}/embed")
@@ -366,12 +435,12 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/analytics/overview")
     def analytics_overview(request: Request) -> Any:
-        """读取分析概览；关键约束是返回结构兼容仪表盘。"""
+        """读取分析概览；关键约束是返回当前仪表盘所需的统计结构。"""
         return _admin(request).analytics_overview()
 
     @app.get("/api/analytics/top-queries")
     def list_top_queries(request: Request) -> Any:
-        """列出高频问题；关键约束是分页参数沿用旧格式。"""
+        """列出高频问题；关键约束是分页参数使用当前列表契约。"""
         return _admin(request).list_top_queries(_query_params(request))
 
     @app.get("/api/analytics/zero-hit")
@@ -391,7 +460,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/analytics/hit-rate")
     def query_hit_rate_timeseries(request: Request) -> Any:
-        """读取命中率时间序列；关键约束是时间范围参数兼容旧 API。"""
+        """读取命中率时间序列；关键约束是时间范围使用当前查询契约。"""
         return _admin(request).query_hit_rate_timeseries(_query_params(request))
 
     @app.get("/api/analytics/cluster-summaries")
@@ -411,7 +480,7 @@ def _admin(request: Request) -> Any:
 
 
 def _query_params(request: Request) -> dict[str, list[str]]:
-    """把 FastAPI query params 转成旧 AdminApp 使用的 parse_qs 形状。"""
+    """把 FastAPI 查询参数转成 AdminApp 接受的多值字典。"""
     result: dict[str, list[str]] = {}
     for key, value in request.query_params.multi_items():
         result.setdefault(key, []).append(value)
@@ -419,10 +488,12 @@ def _query_params(request: Request) -> dict[str, list[str]]:
 
 
 async def _read_json(request: Request) -> dict[str, Any]:
-    """读取 JSON 请求体；关键约束是沿用旧 JSON 大小限制和 object-only 约束。"""
+    """读取显式 JSON object；空 HTTP body 不是 `{}` 的替代请求形状。"""
+    if request.headers.get("content-length") == "0":
+        raise AdminValidationError("request body must be a JSON object")
     raw = await request.body()
     if not raw:
-        return {}
+        raise AdminValidationError("request body must be a JSON object")
     ensure_request_size(len(raw), _admin(request).settings.admin_max_json_bytes, "json")
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -433,8 +504,16 @@ async def _read_json(request: Request) -> dict[str, Any]:
     return payload
 
 
+async def _read_empty_json(request: Request) -> dict[str, Any]:
+    """读取资源级空对象命令；任何字段都属于已删除的客户端 dispatch。"""
+    payload = await _read_json(request)
+    if payload:
+        raise AdminValidationError("request body must be an empty JSON object")
+    return payload
+
+
 def _sse_response(events: Iterable[dict[str, Any]]) -> StreamingResponse:
-    """构造 SSE 响应；关键约束是 event/data 格式兼容现有前端。"""
+    """构造 SSE 响应；关键约束是 event/data 使用当前前端事件契约。"""
 
     def body() -> Iterable[str]:
         """逐条格式化 SSE；关键约束是异常也转成 error 事件。"""

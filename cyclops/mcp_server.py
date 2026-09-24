@@ -19,10 +19,9 @@ from typing import Any, Callable, Mapping
 import mcp.types as mcp_types
 from mcp.server.lowlevel import Server
 
+from cyclops.cli import build_rag_tool
 from cyclops.config import Settings
 from cyclops.db import Database
-from cyclops.llm import ChatClient, EmbeddingClient
-from cyclops.rag import load_system_prompt
 from cyclops.rag_tool import RagTool
 
 
@@ -96,11 +95,8 @@ def resolve_requester(
 
 def _record_event(database: Any, event: dict[str, Any]) -> None:
     """打点写入失败仅记 warning，主路径不受影响。"""
-    record = getattr(database, "record_query_event", None)
-    if record is None:
-        return
     try:
-        record(event)
+        database.record_query_event(event)
     except Exception as exc:
         logger.warning("mcp record_query_event failed: %s", exc, exc_info=True)
 
@@ -112,7 +108,7 @@ async def handle_search(
     database: Any,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """search 工具业务逻辑：调 rag_tool.search → 打点 → 返回结构化结果。"""
+    """search 工具调用唯一检索链路，并记录其真实 rerank 状态。"""
     query = str(args.get("query") or "").strip()
     if not query:
         raise ValueError("search tool requires non-empty 'query'")
@@ -120,9 +116,12 @@ async def handle_search(
     requester_type, requester_id = resolve_requester(args, env=env)
 
     result = rag_tool.search(query)
-    payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    payload = result.to_dict()
     documents = payload.get("documents") or []
     top_score = payload.get("top_score")
+    rerank_used = payload["rerank_used"]
+    if type(rerank_used) is not bool:
+        raise TypeError("RagTool search rerank_used must be bool")
     hit_count = len(documents)
     chunk_ids = [str(doc.get("id") or "") for doc in documents if doc.get("id")]
 
@@ -134,7 +133,7 @@ async def handle_search(
             "retrieved_chunk_ids": chunk_ids,
             "top_score": top_score,
             "hit_count": hit_count,
-            "rerank_used": False,
+            "rerank_used": rerank_used,
             "latency_ms": None,
             "requester_type": requester_type,
             "requester_id": requester_id,
@@ -149,6 +148,7 @@ async def handle_search(
         "hit_count": hit_count,
         "top_k": payload.get("top_k"),
         "min_score": payload.get("min_score"),
+        "rerank_used": rerank_used,
     }
 
 
@@ -161,7 +161,7 @@ async def handle_answer(
     session: Any | None = None,
     progress_token: str | int | None = None,
 ) -> dict[str, Any]:
-    """answer 工具业务逻辑：流式生成回答，逐 delta 通过 progress notification 推送。"""
+    """answer 工具流式转发回答，并以必填 final 事件记录检索诊断。"""
     query = str(args.get("query") or "").strip()
     if not query:
         raise ValueError("answer tool requires non-empty 'query'")
@@ -189,17 +189,12 @@ async def handle_answer(
             final_payload = dict(event)
 
     if final_payload is None:
-        final_payload = {
-            "answer_draft": "",
-            "documents": [],
-            "top_score": None,
-            "hit_count": 0,
-            "top_k": None,
-            "min_score": None,
-            "has_context": False,
-        }
+        raise RuntimeError("RagTool answer stream ended without final event")
 
     documents = final_payload.get("documents") or []
+    rerank_used = final_payload["rerank_used"]
+    if type(rerank_used) is not bool:
+        raise TypeError("RagTool answer rerank_used must be bool")
     chunk_ids = [str(doc.get("id") or "") for doc in documents if doc.get("id")]
 
     _record_event(
@@ -210,7 +205,7 @@ async def handle_answer(
             "retrieved_chunk_ids": chunk_ids,
             "top_score": final_payload.get("top_score"),
             "hit_count": int(final_payload.get("hit_count") or 0),
-            "rerank_used": False,
+            "rerank_used": rerank_used,
             "latency_ms": None,
             "requester_type": requester_type,
             "requester_id": requester_id,
@@ -226,17 +221,16 @@ async def handle_answer(
         "hit_count": int(final_payload.get("hit_count") or 0),
         "top_k": final_payload.get("top_k"),
         "min_score": final_payload.get("min_score"),
+        "rerank_used": rerank_used,
     }
 
 
 def build_mcp_server(
     *,
-    settings: Any,
-    rag_tool_factory: Callable[[], Any],
-    database_factory: Callable[[], Any],
+    services_factory: Callable[[], tuple[Any, Any]],
     env: Mapping[str, str] | None = None,
 ) -> Server:
-    """构造 MCP server 实例，把工具 handler 挂到 SDK 装饰器上。"""
+    """构造 MCP server；每次工具调用从唯一 factory 获取共享数据库的服务对。"""
     server: Server = Server("customer-service-kb")
 
     @server.list_tools()
@@ -252,8 +246,8 @@ def build_mcp_server(
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[mcp_types.ContentBlock]:
-        rag_tool = rag_tool_factory()
-        database = database_factory()
+        """调度 MCP search/answer，关键约束是单次调用共用检索与统计数据库。"""
+        rag_tool, database = services_factory()
         session = None
         progress_token = None
         try:
@@ -285,30 +279,15 @@ def build_mcp_server(
     return server
 
 
-def _default_rag_tool_factory(settings: Settings) -> Callable[[], RagTool]:
-    def factory() -> RagTool:
-        embeddings = EmbeddingClient.from_settings(settings)
-        chat = ChatClient.from_settings(settings)
-        db = Database(settings.database_url)
-        try:
-            system_prompt = load_system_prompt()
-        except FileNotFoundError:
-            system_prompt = ""
-        return RagTool(
-            embeddings=embeddings,
-            db=db,
-            chat=chat,
-            system_prompt=system_prompt,
-            top_k=settings.rag_top_k,
-            min_score=settings.rag_min_score,
-        )
+def _default_mcp_services_factory(
+    settings: Settings,
+) -> Callable[[], tuple[RagTool, Database]]:
+    """为单次 MCP 调用装配 RagTool 与共享 Database，避免检索和打点重复建池。"""
 
-    return factory
-
-
-def _default_database_factory(settings: Settings) -> Callable[[], Database]:
-    def factory() -> Database:
-        return Database(settings.database_url)
+    def factory() -> tuple[RagTool, Database]:
+        """创建同一调用内的服务对，关键约束是 Database 实例完全相同。"""
+        database = Database(settings.database_url)
+        return build_rag_tool(settings, database=database), database
 
     return factory
 
@@ -329,9 +308,7 @@ def run_stdio(settings: Settings) -> None:
     )
 
     server = build_mcp_server(
-        settings=settings,
-        rag_tool_factory=_default_rag_tool_factory(settings),
-        database_factory=_default_database_factory(settings),
+        services_factory=_default_mcp_services_factory(settings),
         env=os.environ,
     )
 

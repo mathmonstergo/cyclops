@@ -8,6 +8,9 @@ import {
   formatMetric,
   formatPercent,
   displayStrategyLabel,
+  type EvaluationRunOverrides,
+  type EvaluationStrategy,
+  selectEvaluationRun,
   summarizeExpected,
 } from './helpers'
 
@@ -20,6 +23,8 @@ export function EvaluationCaseList({
   onRetry,
   onSelect,
   onEdit,
+  strategy,
+  runOverrides,
 }: {
   items: RetrievalEvalCase[]
   activeId: string | null
@@ -28,6 +33,8 @@ export function EvaluationCaseList({
   onRetry: () => void
   onSelect: (id: string) => void
   onEdit: (item: RetrievalEvalCase) => void
+  strategy: EvaluationStrategy
+  runOverrides: EvaluationRunOverrides
 }) {
   if (isPending) {
     return (
@@ -77,6 +84,8 @@ export function EvaluationCaseList({
           active={item.id === activeId}
           onSelect={onSelect}
           onEdit={onEdit}
+          strategy={strategy}
+          runOverrides={runOverrides}
         />
       ))}
     </div>
@@ -89,13 +98,17 @@ function CaseRow({
   active,
   onSelect,
   onEdit,
+  strategy,
+  runOverrides,
 }: {
   item: RetrievalEvalCase
   active: boolean
   onSelect: (id: string) => void
   onEdit: (item: RetrievalEvalCase) => void
+  strategy: EvaluationStrategy
+  runOverrides: EvaluationRunOverrides
 }) {
-  const run = item.latest_run
+  const run = selectEvaluationRun(item, runOverrides, strategy)
   const metrics = run?.metrics
   const expectedSummary = summarizeExpected(item)
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {

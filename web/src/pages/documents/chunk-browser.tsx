@@ -398,6 +398,7 @@ function ChunkNav({
   )
 }
 
+// 切片工具栏集中处理编辑、停用、embedding 与显式 document_chunk KG 抽取。
 function ChunkToolbar({
   chunk,
   fileDisabled,
@@ -460,8 +461,10 @@ function ChunkToolbar({
             disabled={cannotExtractKg || isExtractingKg}
             onClick={async () => {
               try {
+                // 当前上下文已明确是切片，不通过 ID 形状推断来源类型。
                 const result = await createKgJob.mutateAsync({
                   source_id: chunk.id,
+                  source_type: 'document_chunk',
                 })
                 toast.success(formatKgExtractionResult(result))
               } catch (e) {

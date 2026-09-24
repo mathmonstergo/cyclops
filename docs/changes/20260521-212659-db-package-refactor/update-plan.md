@@ -1,5 +1,9 @@
 # db 包拆分计划（Stage 1 架构重构）
 
+> [!IMPORTANT]
+> 本文是历史重构记录。当前检索只使用 `RetrievedKnowledgeChunk` 与 `HybridRetrievalService`，详见
+> `.trellis/spec/backend/cyclops-retrieval-contracts.md`；不得恢复 `RetrievedDocument` 或 FAQ-only search。
+
 ## 背景
 
 `customer_service_agent/db.py` 2157 行、101 个 def/class，是项目第一大文件。随 reranker + query analytics 加进来还在继续涨。同时 `admin_server.py` 也已经 2106 行。

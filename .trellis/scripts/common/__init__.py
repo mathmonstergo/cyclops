@@ -7,75 +7,6 @@ This module provides shared functionality used by other Trellis scripts.
 import io
 import sys
 
-from .active_task import (
-    ActiveTask,
-    clear_active_task,
-    resolve_active_task,
-    resolve_context_key,
-    set_active_task,
-)
-from .paths import (
-    DIR_ARCHIVE,
-    DIR_SCRIPTS,
-    DIR_SPEC,
-    DIR_TASKS,
-    DIR_WORKFLOW,
-    DIR_WORKSPACE,
-    FILE_CURRENT_TASK,
-    FILE_DEVELOPER,
-    FILE_JOURNAL_PREFIX,
-    FILE_TASK_JSON,
-    check_developer,
-    clear_current_task,
-    count_lines,
-    generate_task_date_prefix,
-    get_active_journal_file,
-    get_current_task,
-    get_current_task_abs,
-    get_developer,
-    get_repo_root,
-    get_tasks_dir,
-    get_workspace_dir,
-    has_current_task,
-    normalize_task_ref,
-    resolve_task_ref,
-    set_current_task,
-)
-
-__all__ = [
-    "ActiveTask",
-    "DIR_ARCHIVE",
-    "DIR_SCRIPTS",
-    "DIR_SPEC",
-    "DIR_TASKS",
-    "DIR_WORKFLOW",
-    "DIR_WORKSPACE",
-    "FILE_CURRENT_TASK",
-    "FILE_DEVELOPER",
-    "FILE_JOURNAL_PREFIX",
-    "FILE_TASK_JSON",
-    "check_developer",
-    "clear_active_task",
-    "clear_current_task",
-    "configure_encoding",
-    "count_lines",
-    "generate_task_date_prefix",
-    "get_active_journal_file",
-    "get_current_task",
-    "get_current_task_abs",
-    "get_developer",
-    "get_repo_root",
-    "get_tasks_dir",
-    "get_workspace_dir",
-    "has_current_task",
-    "normalize_task_ref",
-    "resolve_active_task",
-    "resolve_context_key",
-    "resolve_task_ref",
-    "set_active_task",
-    "set_current_task",
-]
-
 # =============================================================================
 # Windows Encoding Fix (MUST be at top, before any other output)
 # =============================================================================
@@ -122,3 +53,40 @@ def configure_encoding() -> None:
         sys.stdout = _configure_stream(sys.stdout)  # type: ignore[assignment]
         sys.stderr = _configure_stream(sys.stderr)  # type: ignore[assignment]
         sys.stdin = _configure_stream(sys.stdin)  # type: ignore[assignment]
+
+
+from .paths import (
+    DIR_WORKFLOW,
+    DIR_WORKSPACE,
+    DIR_TASKS,
+    DIR_ARCHIVE,
+    DIR_SPEC,
+    DIR_SCRIPTS,
+    FILE_DEVELOPER,
+    FILE_CURRENT_TASK,
+    FILE_TASK_JSON,
+    FILE_JOURNAL_PREFIX,
+    get_repo_root,
+    get_developer,
+    check_developer,
+    get_tasks_dir,
+    get_workspace_dir,
+    get_active_journal_file,
+    count_lines,
+    get_current_task,
+    get_current_task_abs,
+    normalize_task_ref,
+    resolve_task_ref,
+    set_current_task,
+    clear_current_task,
+    has_current_task,
+    generate_task_date_prefix,
+)
+
+from .active_task import (
+    ActiveTask,
+    clear_active_task,
+    resolve_active_task,
+    resolve_context_key,
+    set_active_task,
+)

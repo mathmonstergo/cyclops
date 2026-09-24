@@ -344,7 +344,7 @@ def package_mineru_payload_for_kb(payload: dict[str, Any], *, source_file: str) 
 
 def build_import_chunks_from_blocks(
     file_id: str,
-    blocks: list[ParsedBlock | dict[str, Any]],
+    blocks: list[ParsedBlock],
     *,
     max_chars: int = 6000,
     chunk_token_num: int | None = None,
@@ -358,13 +358,14 @@ def build_import_chunks_from_blocks(
     """按指定 RAGFlow-style chunker 把解析块合并为导入审核切块。"""
     normalized = []
     for block in blocks:
-        parsed = _ensure_block(block)
+        if not isinstance(block, ParsedBlock):
+            raise TypeError("blocks must contain ParsedBlock")
         # 保留两类块：①有文字的块；②虽然没文字但带资产路径的块（image/table/equation）。
         # 后者是 MinerU 对无 caption 截图的常见输出 —— 丢掉就等于丢图。
-        has_text = bool(parsed.text.strip())
-        has_assets = bool((parsed.evidence or {}).get("asset_paths"))
+        has_text = bool(block.text.strip())
+        has_assets = bool((block.evidence or {}).get("asset_paths"))
         if has_text or has_assets:
-            normalized.append(parsed)
+            normalized.append(block)
     if not normalized:
         raise MineruParseError("MinerU returned no parseable text")
 
@@ -1456,20 +1457,6 @@ def _ragflow_position_tag(item: dict[str, Any]) -> str | None:
     return f"@@{page_number}\t{x0:.1f}\t{x1:.1f}\t{top:.1f}\t{bottom:.1f}##"
 
 
-def _ensure_block(block: ParsedBlock | dict[str, Any]) -> ParsedBlock:
-    """兼容测试和调用层传入的字典块，统一转为 ParsedBlock。"""
-    if isinstance(block, ParsedBlock):
-        return block
-    return ParsedBlock(
-        text=str(block.get("text", "")).strip(),
-        block_type=str(block.get("block_type", "text")).strip() or "text",
-        page_number=block.get("page_number"),
-        section_title=block.get("section_title"),
-        evidence=dict(block.get("evidence") or {}),
-        position_tag=block.get("position_tag"),
-    )
-
-
 def _build_import_chunk(
     file_id: str,
     chunk_index: int,
@@ -1518,18 +1505,13 @@ def _source_block_payload(block: ParsedBlock) -> dict[str, Any]:
     return payload
 
 
-def _chunk_keywords(blocks: Iterable[ParsedBlock | dict[str, Any]], limit: int = 6) -> list[str]:
+def _chunk_keywords(blocks: Iterable[dict[str, Any]], limit: int = 6) -> list[str]:
     """从来源文件、章节和块类型提取轻量关键词，帮助导入审核列表扫描。"""
     values: list[str] = []
     for block in blocks:
-        if isinstance(block, ParsedBlock):
-            evidence = block.evidence
-            section_title = block.section_title
-            block_type = block.block_type
-        else:
-            evidence = block.get("evidence") if isinstance(block.get("evidence"), dict) else {}
-            section_title = block.get("section_title")
-            block_type = block.get("block_type")
+        evidence = block.get("evidence") if isinstance(block.get("evidence"), dict) else {}
+        section_title = block.get("section_title")
+        block_type = block.get("block_type")
         source_file = evidence.get("source_file")
         if source_file:
             values.append(str(source_file))

@@ -476,17 +476,22 @@ Assistant message navigation should act as a quiet scroll aid rather than a seco
 Knowledge graph review pages must use the existing internal-tool structure instead of a permanent three-column graph workspace:
 
 - Route content root: `flex h-full flex-col`.
-- Top toolbar: search, entity/relation mode, review status filter, type filter, refresh, and extraction entry.
+- Top toolbar: search, entity/relation mode, review status filter, type filter, and refresh.
 - Main content: one dense list/table for either entities or relations.
 - Detail surface: right-side drawer opened from a selected row, containing metadata, evidence, local relationships, and review actions.
 - Extraction results must show review state explicitly: `needs_review`, `usable`, and `disabled`.
 - Evidence must be visible in the drawer before confirmation; KG candidates are AI-generated and must not be confirmed from name/type alone.
+- Review-table live values come from required backend fields: entity `source_count` is labeled `有效来源`, relation `evidence_count` is labeled `有效证据`, and subgraph edges require their own `evidence_count`. The complete `evidence` array is audit history only; its length may appear under `证据历史` but must never stand in for a live count. Rows with `is_valid=false` stay visible with a low-contrast `来源已失效` marker.
+- All KG review reads refetch on mount because backend workers can change source/KG state while the route is inactive. Every successful source or KG mutation reuses the single three-family KG invalidator; component-local Drawer effects must not own cache correctness.
+- Every entity/relation row and selected drawer item carries the backend `review_revision` positive integer. The confirm mutation sends exactly `{"expected_revision": item.review_revision}`; it never sends `{}`, omits the body, substitutes a timestamp, or defaults the revision.
+- A 409 confirm response means the reviewed snapshot was replaced. Do not show a success toast or optimistically keep `usable`; show a refresh-required error and invalidate/refetch the list/detail so the user reviews the new snapshot.
+- Frontend source and the built `cyclops/static/dist` bundle must both contain the revision contract. Rebuild after hook/schema changes; a green source test does not validate the ASGI-mounted stale bundle.
 - 3D or force-graph visualization is a later view over confirmed KG data, not the first MVP review surface.
 
 ```tsx
 // Good: KG review keeps the same page geometry as FAQ management.
 <div className="flex h-full flex-col">
-  <header>{/* search + filters + extraction action */}</header>
+  <header>{/* search + review filters + refresh */}</header>
   <main>{/* entity or relation list */}</main>
   <KgDetailDrawer selected={selected} />
 </div>
@@ -511,14 +516,15 @@ When a workflow needs internal document IDs or chunk IDs, the UI must expose the
 - Shared drawer overlays should animate dimming and blur progressively with the drawer entrance; avoid instant dark overlays followed by panel motion.
 - Shared drawers should slide in from just outside the right edge with restrained easing, rather than appearing through a short fade/offset that feels like a popup.
 - KG extraction from a document chunk should be available from the active chunk toolbar when the chunk is usable and not being edited.
+- KG extraction from a FAQ should be available from that FAQ's management drawer when the FAQ is usable.
 - Do not make users manually copy a chunk ID into the KG page for the common single-chunk extraction path.
-- If the KG page exposes a manual extraction popover, use a single source ID input and let the backend infer whether it is a FAQ ID or a document chunk ID.
+- The KG review page has no manual extraction form. Source pages must send the one explicit locator shape: `source_type` plus `source_id`.
 
 ```tsx
 // Good: the user can copy or act from the source chunk.
 <ChunkToolbar>
   <CopyIdInline label="切片ID" value={chunk.id} />
-  <Button onClick={() => extractKg({ source_id: chunk.id })}>
+  <Button onClick={() => extractKg({ source_type: 'document_chunk', source_id: chunk.id })}>
     KG 抽取
   </Button>
 </ChunkToolbar>

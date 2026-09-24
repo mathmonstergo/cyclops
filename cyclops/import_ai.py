@@ -62,7 +62,7 @@ class ImportAiAssistant:
 
     @staticmethod
     def _parse_json_object(text: str) -> dict[str, Any]:
-        """解析模型返回的 JSON 对象，兼容误包裹的 json fence。"""
+        """解析模型 JSON 对象；外部模型误加 json fence 时先剥离代码块。"""
         stripped = text.strip()
         fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
         if fence_match:

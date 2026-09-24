@@ -1,5 +1,9 @@
 # 第二阶段检索精度优化计划
 
+> [!IMPORTANT]
+> 本文是历史阶段记录。当前文档 child 来源顺序固定为 structured blocks → delimiter → full text，详见
+> `docs/changes/20260714-092948-knowledge-graph-retrieval-review/`；不得恢复 delimiter 优先逻辑。
+
 ## 背景结论
 
 第一阶段已经完成统一 `knowledge_chunks`、意图识别、向量 + 关键词混合召回、RRF 融合、检索评测用例和智能问答调试抽屉。当前目标从“公司级完整落地”收窄为“单人调试下尽快提高真实回答准确率”。

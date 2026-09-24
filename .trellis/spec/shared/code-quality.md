@@ -219,6 +219,31 @@ it('should create a project', async () => {
 
 ---
 
+## Convention: One Contract for 0→1 Features
+
+**What**: New features expose one current contract only. Do not add legacy method aliases,
+synchronous compatibility adapters, dual read/write paths, or silent fallbacks for versions that
+never existed in this project.
+
+**Why**: Speculative compatibility creates dead code, doubles tests and state transitions, and
+obscures the intended architecture before the feature has real users.
+
+```python
+# Wrong: speculative compatibility path for a brand-new API.
+def create_job(payload):
+    job = queue_job(payload)
+    return run_job(job["id"])
+
+# Correct: the new API has one explicit asynchronous contract.
+def queue_job(payload):
+    """Validate input and return the queued job."""
+```
+
+If compatibility is genuinely required later, it must be an explicit user requirement with its
+own migration/removal plan and tests.
+
+---
+
 ## Summary
 
 | Rule                    | Reason              |
@@ -230,3 +255,4 @@ it('should create a project', async () => {
 | Semantic naming         | Readability         |
 | Structured errors       | Consistent handling |
 | Never swallow errors    | Debuggability       |
+| One contract for 0→1    | Avoid speculative compatibility debt |

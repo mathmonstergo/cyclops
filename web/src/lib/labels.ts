@@ -1,19 +1,9 @@
 // 全局状态字典：所有状态文案统一中文，禁止页面里写英文 raw 值。
 // 后端字段命名不变，只在 UI 渲染时翻译。
 
-export const importFileStatusLabel: Record<string, string> = {
-  pending: '待解析',
-  processing: '解析中',
-  parsing: '解析中', // 兜底兼容
-  needs_review: '待复核',
-  completed: '已完成',
-  failed: '解析失败',
-}
-
 export const parseStateLabel: Record<string, string> = {
   pending: '排队中',
   running: '解析中',
-  parsing: '解析中',
   done: '已完成',
   failed: '失败',
   cancelled: '已取消',

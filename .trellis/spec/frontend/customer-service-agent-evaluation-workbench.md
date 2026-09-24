@@ -12,19 +12,33 @@
 ### 2. Signatures
 
 - Frontend pure function:
-  - `buildEvaluationBatchSummary(cases: RetrievalEvalCase[]) -> EvaluationBatchSummary`
-  - `diagnoseEvaluationCase(evalCase: RetrievalEvalCase) -> EvaluationCaseDiagnostic`
+  - `buildEvaluationRunPayload(strategy: EvaluationStrategy) -> RetrievalEvalRunPayload`
+  - `storeEvaluationRunOverride(current: EvaluationRunOverrides, run: RetrievalEvalRun) -> EvaluationRunOverrides`
+  - `selectEvaluationRun(evalCase: RetrievalEvalCase, overrides: EvaluationRunOverrides, strategy: EvaluationStrategy) -> RetrievalEvalRun | null`
+  - `buildEvaluationBatchSummary(cases: RetrievalEvalCase[], strategy: EvaluationStrategy, runOverrides: EvaluationRunOverrides) -> EvaluationBatchSummary`
+  - `diagnoseEvaluationCase(evalCase: RetrievalEvalCase, strategy: EvaluationStrategy, runOverrides: EvaluationRunOverrides) -> EvaluationCaseDiagnostic`
 - Frontend component:
   - `EvaluationBatchPanel({ summary, runState, batchCaseCount, onRunBatch, onSelectCase })`
-- Existing API dependency:
+- API contract:
   - `POST /api/retrieval/eval-cases/{case_id}/run`
+  - `GET /api/retrieval/eval-cases` returns `latest_runs: RetrievalEvalRun[]`
+- UI strategies:
+  - `baseline -> retrieval_hybrid_v1`
+  - `kg_debug -> retrieval_hybrid_v1_kg_debug`
 
 ### 3. Contracts
 
 - Batch MVP does not create a persistent batch/baseline record.
 - Batch run reuses the single-case run API sequentially for the current filtered active cases.
-- Each successful run must update the page's local `runOverrides`, so the case list, batch summary, and selected result panel reflect progress immediately.
-- Batch summary reads current page state only:
+- The run payload has exactly two shapes:
+  - baseline: `{}`;
+  - KG debug: `{"use_kg": true}`.
+- The frontend must never send `null`, `{"use_kg": false}`, a string boolean, or any extra field.
+- `RetrievalEvalCase` has exactly one persisted run field: `latest_runs`. The singular `latest_run` field does not exist.
+- `latest_runs` contains at most one current-contract run for each fixed strategy, ordered baseline then KG debug. A missing strategy remains missing; the UI never displays the other strategy as a fallback.
+- `EvaluationRunOverrides` is keyed by case id and UI strategy. Each successful run updates only that case/strategy slot, so running KG debug cannot overwrite the baseline result and vice versa.
+- The selected result panel, header metrics, batch summary, and diagnostics must all call the same strategy-aware selector.
+- Batch summary reads current page state for the selected strategy only:
   - active cases count;
   - labeled cases count;
   - run count;
@@ -33,13 +47,16 @@
   - average `hit_rate_at_1`;
   - hit/missed/low-rank/granularity/empty/not-run/missing-expected counts.
 - Missing expected source/chunk ids must not be counted as retrieval failure.
-- Cases without a latest run must not be counted as retrieval failure.
+- Cases without a run for the selected strategy must not be counted as retrieval failure.
 
 ### 4. Validation & Error Matrix
 
+- Payload `{}` -> run baseline.
+- Payload `{"use_kg": true}` -> run KG debug.
+- Any other payload shape -> request error from the backend; do not rewrite or retry it as baseline.
 - No expected source/chunk ids -> reason `missing_expected`.
-- Expected ids exist, no latest run -> reason `not_run`.
-- Latest run has no candidates -> reason `empty_candidates`.
+- Expected ids exist, no run for the selected strategy -> reason `not_run`.
+- Selected-strategy run has no candidates -> reason `empty_candidates`.
 - Expected id is absent from TopK -> reason `missed`, unless a chunk-level case has a source-level match that indicates `granularity_mismatch`.
 - Expected id rank is `1` -> reason `hit`.
 - Expected id rank is `> 1` -> reason `low_rank`.
@@ -47,19 +64,30 @@
 
 ### 5. Good/Base/Bad Cases
 
-- Good: user runs active cases, sees progress, and failing cards link back to the case detail.
+- Good: user runs baseline and KG debug for the same case; both persisted/current overrides remain available and the strategy control switches candidates and metrics without rerunning.
+- Good: user runs active cases, sees progress, and failing cards link back to the selected-strategy case detail.
 - Good: unlabeled cases appear as "待标注" and guide the user to label them, not as retrieval failures.
-- Base: page reload keeps only each case's persisted latest run; transient batch progress is reset.
+- Base: page reload restores up to one persisted run per strategy; transient batch progress is reset.
+- Base: only baseline exists; selecting KG debug shows `not_run` rather than baseline data.
 - Bad: adding a backend batch table for the MVP before the workflow needs historical baselines.
 - Bad: averaging missing metrics as zero, which would make unknown results look like failures.
+- Bad: storing overrides as `Record<caseId, RetrievalEvalRun>` or selecting a global newest run, because one strategy silently replaces the other.
+- Bad: sending `{"use_kg": false}` as a second baseline payload.
 
 ### 6. Tests Required
 
 - Node test for `buildEvaluationBatchSummary()` must assert:
+  - summary and diagnostics use only the requested strategy;
+  - a run from the other strategy produces `not_run`, not a fallback result;
   - unlabeled cases are counted as missing expected;
   - missed cases are counted separately;
   - low-rank hits still count as hits and low-rank diagnostics;
   - average metrics ignore unknown values.
+- Node tests for evaluation helpers must assert:
+  - baseline payload is exactly `{}` and KG debug payload is exactly `{"use_kg": true}`;
+  - overrides preserve independent baseline and KG debug slots for one case;
+  - `selectEvaluationRun()` prefers the same-strategy override, then the same-strategy persisted run, then returns `null`;
+  - no `latest_run` shape is accepted by current frontend types.
 - Frontend `npm test`, `npm run lint`, and `npm run build` must pass.
 - Browser verification should load `/#/evaluation` and confirm the batch panel renders.
 
@@ -68,21 +96,23 @@
 #### Wrong
 
 ```typescript
-const failed = cases.filter((item) => item.latest_run?.metrics?.recall_at_k === 0)
+const run = runOverrides[evalCase.id] || evalCase.latest_run
+const summary = buildEvaluationBatchSummary(cases)
 ```
 
-This treats unlabeled and not-run cases as equivalent to retrieval failures.
+This uses the removed singular shape and lets the newest strategy overwrite or contaminate the other strategy's results.
 
 #### Correct
 
 ```typescript
-const summary = buildEvaluationBatchSummary(cases)
+const run = selectEvaluationRun(evalCase, runOverrides, strategy)
+const summary = buildEvaluationBatchSummary(cases, strategy, runOverrides)
 const failures = summary.diagnostics.filter(
   (item) => item.reason === 'missed' || item.reason === 'empty_candidates',
 )
 ```
 
-The UI can now explain whether the next action is labeling, running, or fixing retrieval.
+The selected strategy is explicit everywhere, and baseline/KG debug results remain independently comparable.
 
 ## Scenario: Readable Candidate Provenance
 
@@ -113,9 +143,9 @@ The UI can now explain whether the next action is labeling, running, or fixing r
   - `source_id`: FAQ id for FAQ candidates; import file id for document candidates.
   - `source_chunk_id`: import chunk id for document candidates when available; used to position `DocumentDrawer`.
   - `source_type`: `faq` or `document`.
-  - `source_title`, `section_path`, `page_start`, `page_end`, `block_type`, `content`, `metadata`: readable document provenance fields.
-  - `question`, `answer`, `category`, `tags`: readable FAQ fields.
-  - `channels`, `fused_score`, `vector_score`, `keyword_score`: ranking diagnostics.
+  - `source_title`, `section_path`, `page_start`, `page_end`, `block_type`, and `content`: the only readable provenance fields.
+  - `channels`, `fused_score`, `vector_score`, `keyword_score`, `kg_score`, and `kg_matches`: current ranking diagnostics.
+  - It does not carry `metadata`, `question`, `answer`, `category`, or `tags`; the UI must not recreate removed DTO aliases or fallback reads.
 - Evaluation UI must open source drawers rather than create a separate preview:
   - FAQ candidate -> `setOpenFaqId(item.source_id)`.
   - Document candidate -> `setOpenImportFileId(item.source_id, item.source_chunk_id ?? null)`.
@@ -124,29 +154,29 @@ The UI can now explain whether the next action is labeling, running, or fixing r
 
 ### 4. Validation & Error Matrix
 
-- Missing FAQ `question` but `source_title` exists -> use `source_title`.
-- Missing FAQ `answer` but `content` exists -> use `content`.
+- Null `source_title` -> display the required canonical `source_id` as the secondary identifier; do not read another field shape.
+- Empty `content` -> display an explicit empty excerpt state; do not read `answer` or metadata.
 - Missing document `source_chunk_id` -> open the document drawer without forced chunk positioning.
 - Missing `navigator.clipboard.writeText` or copy failure -> show a toast error; do not silently fail.
 - Unknown strategy/channel/source type -> display the raw value for troubleshooting.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: FAQ candidate shows question, answer excerpt, `查看 FAQ`, and copy icons for source/chunk ids.
+- Good: FAQ candidate shows canonical `source_title`, `content`, `查看 FAQ`, and copy icons for source/chunk ids.
 - Good: Document candidate shows file name, page/section/chunk position, excerpt, `查看切片`, and opens the existing document drawer.
-- Base: If source metadata is incomplete, UI falls back to id text and still allows copy.
+- Base: If optional provenance is absent, the required source id remains visible and copyable.
 - Bad: Showing only `source_id/chunk_id` as the primary candidate text.
 - Bad: Creating a one-off evaluation preview drawer instead of reusing FAQ/document drawers.
 
 ### 6. Tests Required
 
 - Node test for `helpers.ts` must assert:
-  - FAQ helpers prefer `question` and `answer`.
+  - FAQ helpers use only `source_title` and `content`.
   - document helpers include page, section, source chunk id, and excerpt.
   - internal strategy/source labels are translated where known.
-- Python test for `retrieval_eval_item_payload()` must assert FAQ `question`, `answer`, `category`, and `tags` are included.
+- Python test for `retrieval_eval_item_payload()` must assert canonical readable fields are included and duplicate compatibility fields are absent.
 - Frontend `npm test`, `npm run lint`, and `npm run build` must pass.
-- Backend `python -m pytest`, `python -m ruff check .`, and `python -m customer_service_agent.cli check-config` must pass when the environment is available.
+- Backend `python -m pytest`, `python -m ruff check .`, and `python -m cyclops check-config` must pass when the environment is available.
 
 ### 7. Wrong vs Correct
 

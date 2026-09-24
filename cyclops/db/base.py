@@ -4,12 +4,8 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
-
-try:
-    from psycopg_pool import ConnectionPool
-except ImportError:  # pragma: no cover - dependency is declared, fallback keeps old envs usable.
-    ConnectionPool = None  # type: ignore[assignment]
 
 
 class BaseDatabase:
@@ -33,7 +29,7 @@ class BaseDatabase:
         """获取数据库连接上下文；关键约束是有连接池时复用池连接。"""
         if self.pool is not None:
             return self.pool.connection()
-        if self.pool_max_size > 0 and ConnectionPool is not None:
+        if self.pool_max_size > 0:
             self.pool = ConnectionPool(
                 conninfo=self.database_url,
                 min_size=self.pool_min_size,

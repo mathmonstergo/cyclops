@@ -1,5 +1,9 @@
 # 平台问答效果验收工具
 
+> [!IMPORTANT]
+> 本文仅记录早期评测工作台。当前只使用 v2 `latest_runs` 多策略契约，详见
+> `docs/changes/20260714-092948-knowledge-graph-retrieval-review/`；不得恢复 singular `latest_run` 或旧候选 DTO。
+
 ## 修改目标
 
 在内部平台增加一个问答/检索效果验收工作台，让团队能维护标准问题、运行检索评测、查看命中来源和指标，从而判断知识库资料、切块、关键词、别名和检索策略是否有效。

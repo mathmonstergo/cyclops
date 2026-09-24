@@ -13,21 +13,8 @@ def score_to_distance(score: float) -> float:
 
 
 @dataclass(frozen=True)
-class RetrievedDocument:
-    id: str
-    question: str
-    answer: str
-    category: str | None
-    tags: list[str]
-    source_date: str | None
-    confidence: str
-    status: str
-    score: float
-
-
-@dataclass(frozen=True)
 class RetrievedKnowledgeChunk:
-    """统一知识单元检索结果，兼容 FAQ 和文档切片两类来源。"""
+    """统一知识单元检索结果，字段直接对应 canonical FAQ/文档来源契约。"""
 
     id: str
     source_type: str
@@ -48,23 +35,20 @@ class RetrievedKnowledgeChunk:
     status: str
     score: float
 
-    @property
-    def question(self) -> str:
-        """兼容旧 RAG prompt 的问题字段，文档切片使用来源标题。"""
-        return self.source_title or self.source_id
+@dataclass(frozen=True)
+class KgFactHit:
+    """表示显式 KG debug 命中的合成 fact，只用于后续证据展开与诊断。"""
 
-    @property
-    def answer(self) -> str:
-        """兼容旧 RAG prompt 的答案字段，统一返回可引用正文。"""
-        return self.content
+    fact_chunk_id: str
+    fact_id: str
+    fact_type: str
+    fact_rank: int
+    fact_score: float
 
-    @property
-    def category(self) -> str | None:
-        """兼容旧 RAG prompt 的分类字段，优先使用元数据分类。"""
-        return self.metadata.get("category") or self.source_type
 
-    @property
-    def source_date(self) -> str | None:
-        """兼容旧 RAG prompt 的来源日期字段，来自元数据。"""
-        value = self.metadata.get("source_date")
-        return str(value) if value else None
+@dataclass(frozen=True)
+class KgExpandedCandidate:
+    """表示 KG fact 展开的原始知识候选，并保留贡献该候选的 fact 明细。"""
+
+    document: RetrievedKnowledgeChunk
+    kg_matches: tuple[KgFactHit, ...]

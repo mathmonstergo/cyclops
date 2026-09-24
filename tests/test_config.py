@@ -360,3 +360,137 @@ def test_settings_from_env_parses_asgi_performance_values():
     assert settings.embedding_timeout_seconds == 12.0
     assert settings.rerank_timeout_seconds == 8.0
     assert settings.assistant_max_concurrent_streams == 7
+
+
+def test_settings_from_env_uses_default_import_parse_worker_values():
+    """持久解析 worker 未配置时使用明确的正数轮询与 lease 默认值。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+    }
+
+    settings = Settings.from_env(env)
+
+    assert settings.import_parse_worker_poll_interval_seconds == 1.0
+    assert settings.import_parse_worker_lease_seconds == 60
+
+
+def test_settings_from_env_parses_import_parse_worker_values():
+    """持久解析 worker 的轮询与 lease 参数可由部署环境显式覆盖。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+        "IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS": "0.25",
+        "IMPORT_PARSE_WORKER_LEASE_SECONDS": "90",
+    }
+
+    settings = Settings.from_env(env)
+
+    assert settings.import_parse_worker_poll_interval_seconds == 0.25
+    assert settings.import_parse_worker_lease_seconds == 90
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS", "0"),
+        ("IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS", "-0.1"),
+        ("IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS", "nan"),
+        ("IMPORT_PARSE_WORKER_LEASE_SECONDS", "0"),
+        ("IMPORT_PARSE_WORKER_LEASE_SECONDS", "-1"),
+    ],
+)
+def test_settings_from_env_rejects_non_positive_import_parse_worker_values(name, value):
+    """worker 轮询与 lease 必须是有限正数，不能形成忙循环或立即过期。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+        name: value,
+    }
+
+    with pytest.raises(SettingsError, match=name):
+        Settings.from_env(env)
+
+
+def test_settings_from_env_uses_default_kg_extraction_worker_values():
+    """KG worker 默认轮询为 0.5 秒，lease 必须覆盖默认 Chat 超时。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+    }
+
+    settings = Settings.from_env(env)
+
+    assert settings.kg_extraction_worker_poll_seconds == 0.5
+    assert settings.kg_extraction_worker_lease_seconds == 180
+
+
+def test_settings_from_env_parses_kg_extraction_worker_values():
+    """KG worker 只读取当前两个环境名，并保持 lease 大于 Chat 超时。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+        "CHAT_TIMEOUT_SECONDS": "45.5",
+        "KG_EXTRACTION_WORKER_POLL_SECONDS": "0.2",
+        "KG_EXTRACTION_WORKER_LEASE_SECONDS": "120",
+    }
+
+    settings = Settings.from_env(env)
+
+    assert settings.kg_extraction_worker_poll_seconds == 0.2
+    assert settings.kg_extraction_worker_lease_seconds == 120
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("KG_EXTRACTION_WORKER_POLL_SECONDS", "0"),
+        ("KG_EXTRACTION_WORKER_POLL_SECONDS", "-0.1"),
+        ("KG_EXTRACTION_WORKER_POLL_SECONDS", "nan"),
+        ("KG_EXTRACTION_WORKER_LEASE_SECONDS", "0"),
+        ("KG_EXTRACTION_WORKER_LEASE_SECONDS", "-1"),
+        ("KG_EXTRACTION_WORKER_LEASE_SECONDS", "60"),
+        ("KG_EXTRACTION_WORKER_LEASE_SECONDS", "30"),
+    ],
+)
+def test_settings_from_env_rejects_invalid_kg_extraction_worker_values(name, value):
+    """KG poll 必须为有限正数，lease 必须严格覆盖一次 Chat 超时。"""
+    env = {
+        "DATABASE_URL": "postgresql://u:p@127.0.0.1:5432/db",
+        "CHAT_BASE_URL": "https://newapi.example.com/v1",
+        "CHAT_API_KEY": "chat-key",
+        "CHAT_MODEL": "deepseek-chat",
+        "EMBEDDING_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "EMBEDDING_API_KEY": "embedding-key",
+        "EMBEDDING_MODEL": "text-embedding-v4",
+        "CHAT_TIMEOUT_SECONDS": "60",
+        name: value,
+    }
+
+    with pytest.raises(SettingsError, match="KG_EXTRACTION_WORKER"):
+        Settings.from_env(env)

@@ -1,30 +1,24 @@
 import { AlertTriangle, CheckCircle2, Loader2, Target } from 'lucide-react'
 import type { EvaluationBatchSummary, EvaluationCaseDiagnostic, EvaluationDiagnosticReason } from './batch-diagnostics'
+import type { EvaluationBatchRunState } from './batch-state'
 import { formatMetric, formatPercent } from './helpers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/cn'
-
-export type EvaluationBatchRunState = {
-  status: 'idle' | 'running' | 'done'
-  total: number
-  completed: number
-  succeeded: number
-  failed: number
-  currentQuestion?: string
-}
 
 // 批量回归面板展示当前视图的汇总和失败诊断；不持久化批次，只读页面状态。
 export function EvaluationBatchPanel({
   summary,
   runState,
   batchCaseCount,
+  runDisabled,
   onRunBatch,
   onSelectCase,
 }: {
   summary: EvaluationBatchSummary
   runState: EvaluationBatchRunState
   batchCaseCount: number
+  runDisabled: boolean
   onRunBatch: () => void
   onSelectCase: (caseId: string) => void
 }) {
@@ -47,7 +41,7 @@ export function EvaluationBatchPanel({
           variant="outline"
           size="sm"
           onClick={onRunBatch}
-          disabled={isRunning || batchCaseCount === 0}
+          disabled={runDisabled || batchCaseCount === 0}
           title={batchCaseCount > 0 ? '顺序运行当前筛选范围内的启用用例' : '当前筛选范围没有启用用例'}
         >
           {isRunning ? <Loader2 className="size-3.5 animate-spin" /> : <Target className="size-3.5" />}

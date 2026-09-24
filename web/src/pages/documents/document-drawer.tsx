@@ -53,7 +53,7 @@ import {
   DOCUMENT_CHUNKER_OPTIONS,
   type DocumentChunkerType,
   documentChunkerLabel,
-  normalizeDocumentChunkerType,
+  requireDocumentChunkerType,
 } from './chunker-options'
 import { CopyIdButton } from './copy-id-button'
 import { HoverTooltipTrigger } from './hover-tooltip'
@@ -91,7 +91,6 @@ function DrawerInner({ fileId, onClose }: { fileId: string; onClose: () => void 
   const [selectedChunkerOverride, setSelectedChunkerOverride] = useState<DocumentChunkerType | null>(null)
   const [chunkerOpen, setChunkerOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
-  const selectedChunker = selectedChunkerOverride ?? normalizeDocumentChunkerType(file?.chunker_type)
 
   const isParsing = file?.status === 'processing'
   const chunksQ = useImportFileChunks(fileId, {
@@ -101,7 +100,7 @@ function DrawerInner({ fileId, onClose }: { fileId: string; onClose: () => void 
   // 跨抽屉持久化的"任务在跑"探测：即使抽屉关闭再打开，只要 mutation 还在跑就显示 spinner
   const pending = useFilePendingTasks(fileId)
 
-  // 解析状态从 processing 离开时，主动再拉一次 chunks 拿最终结果（避免错过轮询窗口）
+  // Drawer 只负责终态文档缓存和 toast；KG 刷新由不会受组件卸载影响的 parse queryFn 负责。
   const prevStatusRef = useRef<string | undefined>(file?.status)
   useEffect(() => {
     const prev = prevStatusRef.current
@@ -111,7 +110,7 @@ function DrawerInner({ fileId, onClose }: { fileId: string; onClose: () => void 
       qc.invalidateQueries({ queryKey: ['import-files'] })
       if (cur === 'failed') {
         toast.error(`解析失败：${file?.error || '未知错误'}`)
-      } else {
+      } else if (cur === 'needs_review' || cur === 'completed') {
         toast.success(`「${file?.original_name || ''}」解析完成`)
       }
     }
@@ -134,9 +133,11 @@ function DrawerInner({ fileId, onClose }: { fileId: string; onClose: () => void 
   const fireMessages = (messages?: string[]) => (messages || []).forEach((m) => toast(m))
 
   const onParse = async () => {
+    if (!file) return
     try {
-      const r = await parseJob.mutateAsync({ id: fileId, chunker_type: selectedChunker })
-      fireMessages(r.messages?.length ? r.messages : ['已开始解析'])
+      const chunkerType = selectedChunkerOverride ?? requireDocumentChunkerType(file.chunker_type)
+      await parseJob.mutateAsync({ id: fileId, chunker_type: chunkerType })
+      toast('已开始解析')
     } catch (e) {
       toast.error((e as Error).message)
     }
@@ -173,6 +174,7 @@ function DrawerInner({ fileId, onClose }: { fileId: string; onClose: () => void 
   }
 
   if (!file) return <DrawerInnerSkeleton />
+  const selectedChunker = selectedChunkerOverride ?? requireDocumentChunkerType(file.chunker_type)
   return (
     <>
       <DrawerHeader>

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,10 @@ SETTINGS_ENV_FIELDS = {
     "EMBEDDING_TIMEOUT_SECONDS": "embedding_timeout_seconds",
     "RERANK_TIMEOUT_SECONDS": "rerank_timeout_seconds",
     "ASSISTANT_MAX_CONCURRENT_STREAMS": "assistant_max_concurrent_streams",
+    "IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS": "import_parse_worker_poll_interval_seconds",
+    "IMPORT_PARSE_WORKER_LEASE_SECONDS": "import_parse_worker_lease_seconds",
+    "KG_EXTRACTION_WORKER_POLL_SECONDS": "kg_extraction_worker_poll_seconds",
+    "KG_EXTRACTION_WORKER_LEASE_SECONDS": "kg_extraction_worker_lease_seconds",
     "RERANK_BASE_URL": "rerank_base_url",
     "RERANK_API_KEY": "rerank_api_key",
     "RERANK_MODEL": "rerank_model",
@@ -92,6 +97,10 @@ class Settings:
     embedding_timeout_seconds: float = 30.0
     rerank_timeout_seconds: float = 30.0
     assistant_max_concurrent_streams: int = 4
+    import_parse_worker_poll_interval_seconds: float = 1.0
+    import_parse_worker_lease_seconds: int = 60
+    kg_extraction_worker_poll_seconds: float = 0.5
+    kg_extraction_worker_lease_seconds: int = 180
     rerank_base_url: str = ""
     rerank_api_key: str = ""
     rerank_model: str = ""
@@ -229,6 +238,50 @@ class Settings:
         )
         if values["assistant_max_concurrent_streams"] < 1:
             raise SettingsError("ASSISTANT_MAX_CONCURRENT_STREAMS must be >= 1")
+        values["import_parse_worker_poll_interval_seconds"] = cls._float_env(
+            env,
+            "IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS",
+            1.0,
+        )
+        if (
+            not math.isfinite(values["import_parse_worker_poll_interval_seconds"])
+            or values["import_parse_worker_poll_interval_seconds"] <= 0
+        ):
+            raise SettingsError(
+                "IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS must be a finite positive number"
+            )
+        values["import_parse_worker_lease_seconds"] = cls._integer_env(
+            env,
+            "IMPORT_PARSE_WORKER_LEASE_SECONDS",
+            60,
+        )
+        if values["import_parse_worker_lease_seconds"] <= 0:
+            raise SettingsError("IMPORT_PARSE_WORKER_LEASE_SECONDS must be positive")
+        values["kg_extraction_worker_poll_seconds"] = cls._float_env(
+            env,
+            "KG_EXTRACTION_WORKER_POLL_SECONDS",
+            0.5,
+        )
+        if (
+            not math.isfinite(values["kg_extraction_worker_poll_seconds"])
+            or values["kg_extraction_worker_poll_seconds"] <= 0
+        ):
+            raise SettingsError(
+                "KG_EXTRACTION_WORKER_POLL_SECONDS must be a finite positive number"
+            )
+        values["kg_extraction_worker_lease_seconds"] = cls._integer_env(
+            env,
+            "KG_EXTRACTION_WORKER_LEASE_SECONDS",
+            180,
+        )
+        if (
+            values["kg_extraction_worker_lease_seconds"]
+            <= values["chat_timeout_seconds"]
+        ):
+            raise SettingsError(
+                "KG_EXTRACTION_WORKER_LEASE_SECONDS must be greater than "
+                "CHAT_TIMEOUT_SECONDS"
+            )
         values["rerank_base_url"] = env.get("RERANK_BASE_URL", "").strip()
         values["rerank_api_key"] = env.get("RERANK_API_KEY", "").strip()
         values["rerank_model"] = env.get("RERANK_MODEL", "").strip()
@@ -248,6 +301,7 @@ class Settings:
 
     @staticmethod
     def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
+        """读取浮点环境变量；领域范围由调用方按具体配置继续校验。"""
         value = env.get(name)
         if value is None or value == "":
             return default

@@ -1,6 +1,10 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { BookOpen, ClipboardCheck, Loader2, Play, Plus, Search, X } from 'lucide-react'
-import type { RetrievalEvalCase, RetrievalEvalRun } from '@/api/schemas'
+import type {
+  RetrievalEvalCase,
+  RetrievalEvalCaseRecord,
+  RetrievalEvalRun,
+} from '@/api/schemas'
 import {
   useRetrievalEvalCases,
   useRunRetrievalEvalCase,
@@ -15,24 +19,43 @@ import { useUi } from '@/store/ui'
 import { DocumentDrawer } from './documents/document-drawer'
 import { FaqDrawer } from './faqs/faq-drawer'
 import { AliasPanel } from './evaluation/alias-panel'
-import { EvaluationBatchPanel, type EvaluationBatchRunState } from './evaluation/batch-panel'
+import { EvaluationBatchPanel } from './evaluation/batch-panel'
+import {
+  type EvaluationBatchRunSnapshot,
+  selectEvaluationBatchRunState,
+} from './evaluation/batch-state'
 import { CaseDrawer } from './evaluation/case-drawer'
 import { EvaluationCaseList } from './evaluation/case-list'
 import { buildEvaluationBatchSummary } from './evaluation/batch-diagnostics'
 import { EvaluationResultPanel } from './evaluation/result-panel'
-import { CASE_STATUS_OPTIONS, displayStrategyLabel, formatPercent } from './evaluation/helpers'
+import { createEvaluationRunMutex } from './evaluation/run-mutex'
+import {
+  buildEvaluationRunPayload,
+  CASE_STATUS_OPTIONS,
+  displayStrategyLabel,
+  type EvaluationRunOverrides,
+  formatPercent,
+  selectEvaluationRun,
+  storeEvaluationRunOverride,
+  type EvaluationStrategy,
+} from './evaluation/helpers'
 
 // 效果验收工作台主页面；对齐智能问答页的左栏宽度和主面板 header 位置。
 export default function EvaluationPage() {
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('')
+  const [strategy, setStrategy] = useState<EvaluationStrategy>('baseline')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [aliasOpen, setAliasOpen] = useState(false)
   const [editingCase, setEditingCase] = useState<RetrievalEvalCase | null>(null)
-  const [runOverrides, setRunOverrides] = useState<Record<string, RetrievalEvalRun>>({})
-  const [caseOverrides, setCaseOverrides] = useState<Record<string, RetrievalEvalCase>>({})
-  const [batchRunState, setBatchRunState] = useState<EvaluationBatchRunState>(EMPTY_BATCH_RUN_STATE)
+  const [runOverrides, setRunOverrides] = useState<EvaluationRunOverrides>({})
+  const [caseOverrides, setCaseOverrides] = useState<Record<string, RetrievalEvalCaseRecord>>({})
+  const [batchRunSnapshot, setBatchRunSnapshot] = useState<EvaluationBatchRunSnapshot | null>(null)
+  const [runActivity, setRunActivity] = useState<
+    { mode: 'single'; caseId: string } | { mode: 'batch' } | null
+  >(null)
+  const runMutexRef = useRef(createEvaluationRunMutex())
   const { openFaqId, setOpenFaqId, openImportFileId, setOpenImportFileId } = useUi()
   const params = useMemo(
     () => ({ status: status || undefined, limit: 100, offset: 0 }),
@@ -43,12 +66,10 @@ export default function EvaluationPage() {
   const saveCase = useSaveRetrievalEvalCase()
   const items = useMemo(
     () =>
-      (casesQuery.data?.items || []).map((item) => {
-        const mergedCase = caseOverrides[item.id] ? mergeEvalCase(item, caseOverrides[item.id]) : item
-        const runOverride = runOverrides[item.id]
-        return runOverride ? { ...mergedCase, latest_run: runOverride } : mergedCase
-      }),
-    [casesQuery.data?.items, caseOverrides, runOverrides],
+      (casesQuery.data?.items || []).map((item) =>
+        caseOverrides[item.id] ? mergeEvalCase(item, caseOverrides[item.id]) : item,
+      ),
+    [casesQuery.data?.items, caseOverrides],
   )
 
   const filteredItems = useMemo(() => {
@@ -69,19 +90,26 @@ export default function EvaluationPage() {
       ? selectedId
       : filteredItems[0]?.id || null
   const selectedCase = filteredItems.find((item) => item.id === effectiveSelectedId) || null
-  const selectedRun = selectedCase ? runOverrides[selectedCase.id] || null : null
-  const effectiveRun = selectedRun || selectedCase?.latest_run || null
-  const stats = useMemo(() => computeStats(items), [items])
+  const selectedRun = selectedCase
+    ? selectEvaluationRun(selectedCase, runOverrides, strategy)
+    : null
+  const effectiveRun = selectedRun
+  const stats = useMemo(
+    () => computeStats(items, strategy, runOverrides),
+    [items, runOverrides, strategy],
+  )
   const batchCases = useMemo(
     () => filteredItems.filter((item) => item.status === 'active'),
     [filteredItems],
   )
   const batchSummary = useMemo(
-    () => buildEvaluationBatchSummary(filteredItems),
-    [filteredItems],
+    () => buildEvaluationBatchSummary(filteredItems, strategy, runOverrides),
+    [filteredItems, runOverrides, strategy],
   )
-  const isBatchRunning = batchRunState.status === 'running'
-  const runningSelected = runCase.isPending && runCase.variables === selectedCase?.id
+  const batchRunState = selectEvaluationBatchRunState(batchRunSnapshot, strategy)
+  const isRunActive = runActivity !== null
+  const runningSelected =
+    runActivity?.mode === 'single' && runActivity.caseId === selectedCase?.id
 
   // 打开新建用例抽屉；主页面不固定承载编辑表单。
   const openNewCase = () => {
@@ -97,58 +125,94 @@ export default function EvaluationPage() {
 
   // 运行单条评测，并用本地 override 立即刷新详情区的最近运行结果。
   const handleRun = async (caseId: string) => {
+    const lease = runMutexRef.current.tryAcquire()
+    if (lease === null) return
+    const runStrategy = strategy
+    setRunActivity({ mode: 'single', caseId })
     try {
-      const run = await runCase.mutateAsync(caseId)
-      setRunOverrides((current) => ({ ...current, [caseId]: run }))
+      const run = await runCase.mutateAsync({
+        caseId,
+        payload: buildEvaluationRunPayload(runStrategy),
+      })
+      setRunOverrides((current) => storeEvaluationRunOverride(current, run))
       toast.success('评测运行完成')
     } catch (error) {
       toast.error((error as Error).message || '运行评测失败')
+    } finally {
+      runMutexRef.current.release(lease)
+      setRunActivity(null)
     }
   }
 
   // 顺序运行当前筛选范围内的启用用例；MVP 不创建持久化批次，只刷新 latest run。
   const handleRunBatch = async () => {
-    if (isBatchRunning || batchCases.length === 0) return
+    if (batchCases.length === 0) return
+    const lease = runMutexRef.current.tryAcquire()
+    if (lease === null) return
+    const batchStrategy = strategy
+    const runPayload = buildEvaluationRunPayload(batchStrategy)
     let succeeded = 0
     let failed = 0
-    setBatchRunState({
-      status: 'running',
-      total: batchCases.length,
-      completed: 0,
-      succeeded: 0,
-      failed: 0,
-      currentQuestion: batchCases[0]?.question,
+    setRunActivity({ mode: 'batch' })
+    setBatchRunSnapshot({
+      strategy: batchStrategy,
+      runState: {
+        status: 'running',
+        total: batchCases.length,
+        completed: 0,
+        succeeded: 0,
+        failed: 0,
+        currentQuestion: batchCases[0]?.question,
+      },
     })
-    for (const [index, item] of batchCases.entries()) {
-      setBatchRunState((current) => ({ ...current, currentQuestion: item.question }))
-      try {
-        const run = await runCase.mutateAsync(item.id)
-        succeeded += 1
-        setRunOverrides((current) => ({ ...current, [item.id]: run }))
-      } catch (error) {
-        failed += 1
-        toast.error(`${item.question}：${(error as Error).message || '运行失败'}`)
-      } finally {
-        const completed = index + 1
-        setBatchRunState({
-          status: completed === batchCases.length ? 'done' : 'running',
-          total: batchCases.length,
-          completed,
-          succeeded,
-          failed,
-          currentQuestion: batchCases[index + 1]?.question,
+    try {
+      for (const [index, item] of batchCases.entries()) {
+        setBatchRunSnapshot({
+          strategy: batchStrategy,
+          runState: {
+            status: 'running',
+            total: batchCases.length,
+            completed: index,
+            succeeded,
+            failed,
+            currentQuestion: item.question,
+          },
         })
+        try {
+          const run = await runCase.mutateAsync({ caseId: item.id, payload: runPayload })
+          succeeded += 1
+          setRunOverrides((current) => storeEvaluationRunOverride(current, run))
+        } catch (error) {
+          failed += 1
+          toast.error(`${item.question}：${(error as Error).message || '运行失败'}`)
+        } finally {
+          const completed = index + 1
+          setBatchRunSnapshot({
+            strategy: batchStrategy,
+            runState: {
+              status: completed === batchCases.length ? 'done' : 'running',
+              total: batchCases.length,
+              completed,
+              succeeded,
+              failed,
+              currentQuestion: batchCases[index + 1]?.question,
+            },
+          })
+        }
       }
-    }
-    if (failed > 0) {
-      toast.error(`批量运行完成：成功 ${succeeded}，失败 ${failed}`)
-    } else {
-      toast.success(`批量运行完成：${succeeded} 个用例`)
+      if (failed > 0) {
+        toast.error(`批量运行完成：成功 ${succeeded}，失败 ${failed}`)
+      } else {
+        toast.success(`批量运行完成：${succeeded} 个用例`)
+      }
+    } finally {
+      runMutexRef.current.release(lease)
+      setRunActivity(null)
     }
   }
 
   // 保存后选中新用例；列表刷新由 mutation 的 query invalidation 负责。
-  const handleSaved = (item: RetrievalEvalCase) => {
+  const handleSaved = (item: RetrievalEvalCaseRecord) => {
     setCaseOverrides((current) => ({ ...current, [item.id]: item }))
     setSelectedId(item.id)
   }
@@ -240,6 +304,8 @@ export default function EvaluationPage() {
             onRetry={() => void casesQuery.refetch()}
             onSelect={setSelectedId}
             onEdit={openEditCase}
+            strategy={strategy}
+            runOverrides={runOverrides}
           />
         </div>
         <div className="shrink-0 border-t border-(--color-border) px-3 py-2 text-[11px] text-(--color-text-faint)">
@@ -269,11 +335,16 @@ export default function EvaluationPage() {
             <BookOpen className="size-3.5" />
             别名词典
           </Button>
+          <StrategyControl
+            value={strategy}
+            onChange={setStrategy}
+            disabled={isRunActive}
+          />
           <Button
             variant="primary"
             size="sm"
             onClick={() => selectedCase && void handleRun(selectedCase.id)}
-            disabled={!selectedCase || runningSelected || isBatchRunning || selectedCase.status !== 'active'}
+            disabled={!selectedCase || isRunActive || selectedCase.status !== 'active'}
             title={selectedCase?.status === 'active' ? '运行单条评测' : '禁用用例不可运行'}
           >
             {runningSelected ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
@@ -287,13 +358,14 @@ export default function EvaluationPage() {
               summary={batchSummary}
               runState={batchRunState}
               batchCaseCount={batchCases.length}
+              runDisabled={isRunActive}
               onRunBatch={() => void handleRunBatch()}
               onSelectCase={setSelectedId}
             />
             <div className="min-h-0 flex-1">
               <EvaluationResultPanel
                 evalCase={selectedCase}
-                runOverride={selectedRun}
+                run={selectedRun}
                 onMarkExpected={handleMarkExpected}
                 onOpenCandidate={handleOpenCandidate}
                 markingExpected={saveCase.isPending}
@@ -324,20 +396,52 @@ export default function EvaluationPage() {
   )
 }
 
-const EMPTY_BATCH_RUN_STATE: EvaluationBatchRunState = {
-  status: 'idle',
-  total: 0,
-  completed: 0,
-  succeeded: 0,
-  failed: 0,
+// 评测策略分段控件只暴露 baseline 与显式 KG debug，不影响正式问答默认策略。
+function StrategyControl({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: EvaluationStrategy
+  onChange: (value: EvaluationStrategy) => void
+  disabled: boolean
+}) {
+  const options: { value: EvaluationStrategy; label: string }[] = [
+    { value: 'baseline', label: '基线' },
+    { value: 'kg_debug', label: 'KG 调试' },
+  ]
+  return (
+    <div className="flex items-center gap-0.5 rounded-(--radius-control) border border-(--color-border) bg-(--color-surface-2) p-0.5">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          onClick={() => onChange(option.value)}
+          disabled={disabled}
+          aria-pressed={value === option.value}
+          className={cn(
+            'cursor-pointer rounded-(--radius-control) px-2.5 py-1 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+            value === option.value
+              ? 'bg-(--color-primary) text-white'
+              : 'text-(--color-text-muted) hover:text-(--color-text)',
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
 }
 
-// 合并服务端保存后的用例快照；保存接口不返回 latest_run 时保留当前运行结果。
-function mergeEvalCase(current: RetrievalEvalCase, saved: RetrievalEvalCase): RetrievalEvalCase {
+// 合并服务端保存后的用例快照；运行历史只以列表接口的 latest_runs 为准。
+function mergeEvalCase(
+  current: RetrievalEvalCase,
+  saved: RetrievalEvalCaseRecord,
+): RetrievalEvalCase {
   return {
     ...current,
     ...saved,
-    latest_run: saved.latest_run ?? current.latest_run,
+    latest_runs: current.latest_runs,
   }
 }
 
@@ -349,7 +453,11 @@ function appendUnique(values: string[], value: string | undefined | null): strin
 }
 
 // 统计顶部工具栏指标；只读用例快照，不在这里触发数据请求。
-function computeStats(items: RetrievalEvalCase[]): {
+function computeStats(
+  items: RetrievalEvalCase[],
+  strategy: EvaluationStrategy,
+  runOverrides: EvaluationRunOverrides,
+): {
   averageRecall?: number
   missingExpected: number
 } {
@@ -360,7 +468,7 @@ function computeStats(items: RetrievalEvalCase[]): {
     if ((item.expected_source_ids?.length || 0) === 0 && (item.expected_chunk_ids?.length || 0) === 0) {
       missingExpected += 1
     }
-    const recall = item.latest_run?.metrics?.recall_at_k
+    const recall = selectEvaluationRun(item, runOverrides, strategy)?.metrics?.recall_at_k
     if (typeof recall === 'number') {
       recallSum += recall
       recallCount += 1

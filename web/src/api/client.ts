@@ -1,5 +1,5 @@
 // 统一 fetch 封装 + 错误归一化。
-// admin_server.py 的 classify_error_response 会返回 { error: { code, message } } + 4xx/5xx 状态码。
+// classify_error_response 的当前唯一错误体是 { error: string } + 4xx/5xx 状态码。
 
 export class ApiError extends Error {
   status: number
@@ -59,12 +59,12 @@ export async function requestJson<T = unknown>(
     }
   }
   if (!res.ok) {
-    const errPayload = (parsed as { error?: { code?: string; message?: string } } | undefined)
-      ?.error
+    const errorValue = (parsed as { error?: unknown } | undefined)?.error
+    const message = typeof errorValue === 'string' && errorValue.trim() ? errorValue : null
     throw new ApiError(
-      errPayload?.message || `请求失败 (${res.status})`,
+      message || `请求失败 (${res.status})`,
       res.status,
-      errPayload?.code || 'http_error',
+      'http_error',
     )
   }
   return parsed as T

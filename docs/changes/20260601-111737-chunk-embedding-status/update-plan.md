@@ -1,5 +1,9 @@
 # 切片级 embedding 状态修复
 
+> [!IMPORTANT]
+> 本文是历史缺陷记录。当前文档身份、parent/child 和 embedding 状态契约以
+> `.trellis/spec/backend/cyclops-db-contracts.md` 为准；不得从本文恢复旧 `RetrievedDocument` 或旧关联推断。
+
 - 时间：2026-06-01 11:17
 - 类型：bug 修复（取数 SQL / API 输出派生字段），不改 schema、不改写已存数据
 - 来源：用户验收时发现 —— #15 点「重新向量」提示「已重新生成（5 条）」，但切片仍显示「未索引」，且横滚轴圆点与工具栏状态点颜色不同步
@@ -139,5 +143,4 @@
 
 ### 已知技术债（本次未动，单独记一笔）
 - **两条 FAQ 检索栈并存**：旧 `db.search()` 直查 `faq_documents`（`rag.py`/`rag_tool.py`/`cli.py` 链路）与新 `knowledge_chunks` 统一检索（`retrieval.py` 链路）是历史并行实现。本次为保证「FAQ 禁用真正生效」**两条都加了过滤**；后续应收敛为单一检索栈（统一走 knowledge_chunks），删除直查路径，避免每加一个过滤条件都要改两处。属独立清理项，需用户排期，**不在本次范围**。
-
 

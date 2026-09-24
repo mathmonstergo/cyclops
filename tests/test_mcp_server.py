@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from cyclops.mcp_server import (
     MCP_TOOL_DEFINITIONS,
     build_mcp_server,
@@ -64,7 +66,8 @@ class FakeMcpSession:
         )
 
 
-def _make_search_result(documents=None, top_score=0.82):
+def _make_search_result(documents=None, top_score=0.82, *, rerank_used=False):
+    """构造 MCP 搜索结果，rerank_used 是必填的统一检索诊断。"""
     documents = documents if documents is not None else [
         {
             "id": "kc_1",
@@ -87,6 +90,7 @@ def _make_search_result(documents=None, top_score=0.82):
         "top_score": top_score if documents else None,
         "top_k": 5,
         "min_score": 0.35,
+        "rerank_used": rerank_used,
         "documents": documents,
     }
     return SimpleNamespace(to_dict=lambda: payload)
@@ -100,6 +104,29 @@ def test_mcp_tool_definitions_expose_search_and_answer():
     for tool in MCP_TOOL_DEFINITIONS:
         assert "query" in tool["inputSchema"]["properties"]
         assert "query" in tool["inputSchema"]["required"]
+
+
+def test_default_mcp_services_factory_reuses_database_for_retrieval_and_analytics(
+    monkeypatch,
+):
+    """MCP 每次调用必须让 RagTool 检索与 analytics 共用同一 Database。"""
+    from cyclops.mcp_server import _default_mcp_services_factory
+
+    settings = SimpleNamespace(database_url="postgresql://unused")
+    database = object()
+    rag_tool = object()
+    calls = []
+
+    monkeypatch.setattr("cyclops.mcp_server.Database", lambda database_url: database)
+    monkeypatch.setattr(
+        "cyclops.mcp_server.build_rag_tool",
+        lambda actual, *, database: calls.append((actual, database)) or rag_tool,
+    )
+
+    actual_tool, actual_database = _default_mcp_services_factory(settings)()
+
+    assert (actual_tool, actual_database) == (rag_tool, database)
+    assert calls == [(settings, database)]
 
 
 def test_resolve_requester_prefers_args_then_env_then_default():
@@ -117,7 +144,7 @@ def test_resolve_requester_prefers_args_then_env_then_default():
 
 def test_handle_search_returns_documents_and_records_event():
     """search 工具应调 rag_tool.search 拿候选并把命中信息打点到 analytics。"""
-    rag_tool = FakeRagTool(search_result=_make_search_result())
+    rag_tool = FakeRagTool(search_result=_make_search_result(rerank_used=True))
     db = FakeDatabase()
 
     result = asyncio.run(
@@ -142,7 +169,9 @@ def test_handle_search_returns_documents_and_records_event():
     assert "kc_1" in event["retrieved_chunk_ids"]
     assert event["requester_type"] == "agent"
     assert event["requester_id"] == "writer-1"
+    assert event["rerank_used"] is True
     assert event["metadata"]["flow"] == "mcp_search"
+    assert result["rerank_used"] is True
 
 
 def test_handle_search_handles_no_results_without_crashing():
@@ -175,6 +204,7 @@ def test_handle_answer_streams_deltas_via_progress_notification():
                 "hit_count": 1,
                 "top_k": 5,
                 "min_score": 0.35,
+                "rerank_used": True,
                 "has_context": True,
             },
         ]
@@ -210,7 +240,9 @@ def test_handle_answer_streams_deltas_via_progress_notification():
     event = db.recorded[0]
     assert event["query"] == "Why is the assigned item missing?"
     assert event["hit_count"] == 1
+    assert event["rerank_used"] is True
     assert event["metadata"]["flow"] == "mcp_answer"
+    assert result["rerank_used"] is True
 
 
 def test_handle_answer_works_without_progress_token_or_session():
@@ -226,6 +258,7 @@ def test_handle_answer_works_without_progress_token_or_session():
                 "hit_count": 0,
                 "top_k": 5,
                 "min_score": 0.35,
+                "rerank_used": False,
                 "has_context": False,
             },
         ]
@@ -248,6 +281,21 @@ def test_handle_answer_works_without_progress_token_or_session():
     assert db.recorded[0]["hit_count"] == 0
 
 
+def test_handle_answer_requires_canonical_final_event():
+    """RagTool 流缺少 final 时必须报错，不得伪造一个空结果兼容非法流。"""
+    rag_tool = FakeRagTool(stream_events=[{"type": "delta", "text": "partial"}])
+
+    with pytest.raises(RuntimeError, match="final"):
+        asyncio.run(
+            handle_answer(
+                {"query": "q"},
+                rag_tool=rag_tool,
+                database=FakeDatabase(),
+                env={},
+            )
+        )
+
+
 def test_handle_search_swallows_analytics_failures():
     """analytics 写入失败时主路径仍要返回正常结果。"""
 
@@ -263,15 +311,11 @@ def test_handle_search_swallows_analytics_failures():
 
 def test_build_mcp_server_registers_tool_handlers():
     """build_mcp_server 返回的 Server 实例应能列出工具，确认装饰器挂载成功。"""
-
-    class StubSettings:
-        rag_top_k = 5
-        rag_min_score = 0.35
-
     server = build_mcp_server(
-        settings=StubSettings(),
-        rag_tool_factory=lambda: FakeRagTool(search_result=_make_search_result()),
-        database_factory=lambda: FakeDatabase(),
+        services_factory=lambda: (
+            FakeRagTool(search_result=_make_search_result()),
+            FakeDatabase(),
+        ),
         env={},
     )
 

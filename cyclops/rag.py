@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Any, Literal, Sequence, TypedDict
 
-from cyclops.db import RetrievedDocument
+from cyclops.db import RetrievedKnowledgeChunk
 
 
 NO_CONTEXT_MESSAGE = (
@@ -28,17 +28,30 @@ def load_system_prompt(path: str | Path = "system_prompt.txt") -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
-def format_document(index: int, doc: RetrievedDocument) -> str:
+def format_document(index: int, doc: RetrievedKnowledgeChunk) -> str:
+    """格式化统一知识上下文，只接受 canonical 模型并直接展示来源定位字段。"""
+    if not isinstance(doc, RetrievedKnowledgeChunk):
+        raise TypeError("RAG document must be RetrievedKnowledgeChunk")
     tags = "、".join(doc.tags)
+    section_path = " > ".join(doc.section_path)
+    if doc.page_start is None and doc.page_end is None:
+        page = ""
+    elif doc.page_start == doc.page_end:
+        page = str(doc.page_start)
+    else:
+        page = f"{doc.page_start or ''}-{doc.page_end or ''}"
     return "\n".join(
         [
             f"[{index}] id={doc.id} score={doc.score:.2f}",
-            f"category={doc.category or ''}",
-            f"question={doc.question}",
-            f"answer={doc.answer}",
+            f"source_type={doc.source_type}",
+            f"source_id={doc.source_id}",
+            f"source_chunk_id={doc.source_chunk_id or ''}",
+            f"source_title={doc.source_title or ''}",
+            f"section_path={section_path}",
+            f"page={page}",
+            f"content={doc.content}",
             f"tags={tags}",
-            f"source_date={doc.source_date or ''}",
-            f"confidence={doc.confidence}",
+            f"confidence={doc.confidence or ''}",
         ]
     )
 
@@ -114,9 +127,10 @@ def format_conversation_context(context: ConversationContext | None) -> str:
 
 def build_user_prompt(
     question: str,
-    docs: Sequence[RetrievedDocument],
+    docs: Sequence[RetrievedKnowledgeChunk],
     conversation_context: ConversationContext | None = None,
 ) -> str:
+    """构造回答提示词，关键约束是只从 canonical chunk 读取事实与来源。"""
     if docs:
         context = "\n\n".join(
             format_document(index, doc) for index, doc in enumerate(docs, start=1)
@@ -148,29 +162,28 @@ def build_user_prompt(
 
 
 class RagService:
+    """生成客服回答，关键约束是检索只依赖唯一 HybridRetrievalService。"""
+
     def __init__(
         self,
-        embeddings: Any,
-        db: Any,
+        retrieval: Any,
         chat: Any,
         system_prompt: str,
-        top_k: int,
-        min_score: float,
-    ):
-        self.embeddings = embeddings
-        self.db = db
+    ) -> None:
+        """保存回答依赖；检索阈值和模型统一由 retrieval 服务持有。"""
+        self.retrieval = retrieval
         self.chat = chat
         self.system_prompt = system_prompt
-        self.top_k = top_k
-        self.min_score = min_score
 
     def answer(self, question: str) -> str:
-        query_embedding = self.embeddings.embed(question)
-        docs = self.db.search(
-            query_embedding,
-            top_k=self.top_k,
-            min_score=self.min_score,
+        """检索可用知识并生成回答，正式问答固定关闭 KG debug。"""
+        retrieval_result = self.retrieval.retrieve(
+            question,
+            include_parent_context=True,
+            use_kg=False,
         )
+        docs = [candidate.document for candidate in retrieval_result.candidates]
+        docs.extend(retrieval_result.parent_documents)
         prompt = build_user_prompt(question, docs)
         response = self.chat.complete(self.system_prompt, prompt).strip()
         if not response:

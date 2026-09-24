@@ -1,7 +1,6 @@
-interface KgExtractionCounts {
-  entity_count?: number | null
-  relation_count?: number | null
-}
+import type { KgExtractionJob } from '@/api/schemas'
+
+type KgExtractionCounts = Pick<KgExtractionJob, 'entity_count' | 'relation_count'>
 
 interface ChunkPageLocator {
   page_start?: number | null
@@ -10,7 +9,7 @@ interface ChunkPageLocator {
 
 // 整理 KG 抽取完成提示，关键约束是直接显示后端返回的实体/关系计数。
 export function formatKgExtractionResult(result: KgExtractionCounts): string {
-  return `KG 候选已生成：${result.entity_count ?? 0} 个实体，${result.relation_count ?? 0} 条关系`
+  return `KG 候选已生成：${result.entity_count} 个实体，${result.relation_count} 条关系`
 }
 
 // 格式化切片页码定位，关键约束是只显示页码，不把 block_type 这类解析内部类型暴露给用户。

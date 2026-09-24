@@ -1,4 +1,9 @@
 import type { RetrievalEvalCase, RetrievalEvalItem } from '@/api/schemas'
+import {
+  type EvaluationRunOverrides,
+  type EvaluationStrategy,
+  selectEvaluationRun,
+} from './helpers.ts'
 
 export type EvaluationDiagnosticReason =
   | 'missing_expected'
@@ -38,17 +43,25 @@ export type EvaluationBatchSummary = {
   diagnostics: EvaluationCaseDiagnostic[]
 }
 
-// 汇总当前评测用例的 latest run；关键约束是不持久化批次，只计算当前视图状态。
-export function buildEvaluationBatchSummary(cases: RetrievalEvalCase[]): EvaluationBatchSummary {
+// 汇总当前策略的最新运行；关键约束是不跨策略回退或混算指标。
+export function buildEvaluationBatchSummary(
+  cases: RetrievalEvalCase[],
+  strategy: EvaluationStrategy,
+  runOverrides: EvaluationRunOverrides,
+): EvaluationBatchSummary {
   const activeCases = cases.filter((item) => item.status === 'active')
-  const diagnostics = activeCases.map((item) => diagnoseEvaluationCase(item))
+  const diagnostics = activeCases.map((item) =>
+    diagnoseEvaluationCase(item, strategy, runOverrides),
+  )
   const labeledDiagnostics = diagnostics.filter((item) => item.expectedLevel !== 'none')
-  const runDiagnostics = labeledDiagnostics.filter((item) => typeof item.recall === 'number')
+  const selectedRuns = activeCases
+    .map((item) => selectEvaluationRun(item, runOverrides, strategy))
+    .filter((run) => run !== null)
   return {
     caseCount: cases.length,
     activeCaseCount: activeCases.length,
     labeledCaseCount: labeledDiagnostics.length,
-    runCount: runDiagnostics.length,
+    runCount: selectedRuns.length,
     hitCount: diagnostics.filter((item) => item.reason === 'hit' || item.reason === 'low_rank').length,
     missedCount: diagnostics.filter((item) => item.reason === 'missed').length,
     lowRankCount: diagnostics.filter((item) => item.reason === 'low_rank').length,
@@ -56,21 +69,25 @@ export function buildEvaluationBatchSummary(cases: RetrievalEvalCase[]): Evaluat
     emptyCandidateCount: diagnostics.filter((item) => item.reason === 'empty_candidates').length,
     notRunCount: diagnostics.filter((item) => item.reason === 'not_run').length,
     missingExpectedCount: diagnostics.filter((item) => item.reason === 'missing_expected').length,
-    averageRecall: average(runDiagnostics.map((item) => item.recall)),
-    averageMrr: average(runDiagnostics.map((item) => item.mrr)),
-    top1Rate: average(runDiagnostics.map((item) => item.top1)),
+    averageRecall: average(labeledDiagnostics.map((item) => item.recall)),
+    averageMrr: average(labeledDiagnostics.map((item) => item.mrr)),
+    top1Rate: average(labeledDiagnostics.map((item) => item.top1)),
     diagnostics,
   }
 }
 
-// 诊断单条用例的最近运行结果；关键约束是未标注和未运行不算作检索失败。
-export function diagnoseEvaluationCase(evalCase: RetrievalEvalCase): EvaluationCaseDiagnostic {
+// 诊断单条用例当前策略的运行；关键约束是未标注和未运行不算作检索失败。
+export function diagnoseEvaluationCase(
+  evalCase: RetrievalEvalCase,
+  strategy: EvaluationStrategy,
+  runOverrides: EvaluationRunOverrides,
+): EvaluationCaseDiagnostic {
   const expectedLevel = expectedHitLevel(evalCase)
   if (expectedLevel === 'none') {
     return baseDiagnostic(evalCase, 'missing_expected', expectedLevel)
   }
 
-  const run = evalCase.latest_run
+  const run = selectEvaluationRun(evalCase, runOverrides, strategy)
   if (!run) {
     return baseDiagnostic(evalCase, 'not_run', expectedLevel)
   }

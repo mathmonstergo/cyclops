@@ -52,7 +52,7 @@ export function Composer({
             onChange={(e) => onChange(e.target.value)}
             onKeyDown={(e) => {
               // Enter 发送 / Shift+Enter 换行（仿 ChatGPT/Claude）。
-              // 仍兼容 Cmd/Ctrl+Enter 发送，输入法组合（compositionend 期间的 Enter）不触发。
+              // Cmd/Ctrl+Enter 同样发送；输入法组合（compositionend 期间的 Enter）不触发。
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault()
                 if (canSend) onSend()

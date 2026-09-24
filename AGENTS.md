@@ -22,6 +22,7 @@
 
 - 每个新写或修改的方法、函数、类方法都需要有中文注释或中文 docstring，说明“做什么”和“关键约束”。注释要服务理解，不写空泛说明。
 - 优先使用简洁直接的实现。不要因为担心所有极端情况而写过量兜底；兜底前先判断它是否真实必要。
+- 0→1 新功能只保留唯一的当前契约；不得为不存在的旧版本增加方法别名、同步适配入口、双路径、双写或静默 fallback，除非用户明确要求。
 - 防御性编程只覆盖明确会发生、影响用户体验或数据正确性的场景。没有清晰收益的多层包装、重复校验、宽泛异常吞噬都应避免。
 - 遵循现有模块职责：配置在 `config.py`，数据库读写在 `db.py`，RAG 逻辑在 `rag.py` / `rag_tool.py`，AI 辅助在 `ai_assist.py`，本地管理 API 在 `admin_server.py`，静态页面在 `cyclops/static/`。
 - 不做无关重构，不混入格式化噪音，不回滚用户已有改动。
@@ -63,3 +64,25 @@
 - 最终说明要包含：改了什么、验证了什么、还有什么风险或未做事项。
 - 如果做了较大改动，要同步更新对应 `docs/changes/<timestamp>-<topic>/` 中的计划和确认记录。
 - 不主动提交 Git commit，除非用户明确要求。
+
+<!-- TRELLIS:START -->
+# Trellis Instructions
+
+These instructions are for AI assistants working in this project.
+
+This project is managed by Trellis. The working knowledge you need lives under `.trellis/`:
+
+- `.trellis/workflow.md` — development phases, when to create tasks, skill routing
+- `.trellis/spec/` — package- and layer-scoped coding guidelines (read before writing code in a given layer)
+- `.trellis/workspace/` — per-developer journals and session traces
+- `.trellis/tasks/` — active and archived tasks (PRDs, research, jsonl context)
+
+If a Trellis command is available on your platform (e.g. `/trellis:finish-work`, `/trellis:continue`), prefer it over manual steps. Not every platform exposes every command.
+
+If you're using Codex or another agent-capable tool, additional project-scoped helpers may live in:
+- `.agents/skills/` — reusable Trellis skills
+- `.codex/agents/` — optional custom subagents
+
+Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
+
+<!-- TRELLIS:END -->

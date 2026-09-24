@@ -109,7 +109,7 @@ class ImportQuestionAssistant:
 
     @staticmethod
     def _parse_json_object(text: str) -> dict[str, Any]:
-        """兼容模型偶尔输出 ```json fence 的情况。"""
+        """解析模型 JSON 对象；外部模型误加 json fence 时先剥离代码块。"""
         stripped = (text or "").strip()
         fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
         if fence_match:

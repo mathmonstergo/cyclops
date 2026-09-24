@@ -18,6 +18,7 @@ import {
   candidateScore,
   candidateSourceLabel,
   displayStrategyLabel,
+  evaluationCandidateState,
   formatCount,
   formatDateTime,
   formatMetric,
@@ -31,13 +32,13 @@ import {
 // 运行结果详情面板；只展示当前用例和最近一次/刚完成的运行结果。
 export function EvaluationResultPanel({
   evalCase,
-  runOverride,
+  run,
   onMarkExpected,
   onOpenCandidate,
   markingExpected,
 }: {
   evalCase: RetrievalEvalCase | null
-  runOverride: RetrievalEvalRun | null
+  run: RetrievalEvalRun | null
   onMarkExpected?: (
     item: RetrievalEvalRun['retrieved_items'][number],
     level: 'source' | 'chunk',
@@ -57,10 +58,10 @@ export function EvaluationResultPanel({
     )
   }
 
-  const run = runOverride || evalCase.latest_run || null
   const metrics = run?.metrics
   const analysis = run?.analysis
   const items = run?.retrieved_items || []
+  const candidateState = evaluationCandidateState(run)
 
   return (
     <div className="h-full overflow-y-auto scroll-thin px-5 py-4">
@@ -79,6 +80,7 @@ export function EvaluationResultPanel({
         <CandidateTable
           evalCase={evalCase}
           items={items}
+          state={candidateState}
           onMarkExpected={onMarkExpected}
           onOpenCandidate={onOpenCandidate}
           markingExpected={markingExpected}
@@ -160,8 +162,32 @@ function TraceBlock({ run }: { run: RetrievalEvalRun | null }) {
             <span className="font-mono text-[10px] text-(--color-text-faint)">
               关键词 {formatCount(analysis?.keyword_count)}
             </span>
+            {analysis?.use_kg && (
+              <>
+                <span className="font-mono text-[10px] text-(--color-text-faint)">
+                  KG fact {analysis.kg_fact_count}
+                </span>
+                <span className="font-mono text-[10px] text-(--color-text-faint)">
+                  展开 {analysis.kg_expanded_candidate_count}
+                </span>
+              </>
+            )}
             <CheckCircle2 className="size-3.5 text-(--color-success)" />
           </div>
+          {analysis?.use_kg && analysis.kg_facts.length > 0 && (
+            <div className="space-y-1 rounded-(--radius-control) border border-(--color-border-soft) bg-(--color-surface-2) p-2">
+              {analysis.kg_facts.slice(0, 6).map((fact) => (
+                <div
+                  key={fact.fact_chunk_id}
+                  className="flex min-w-0 items-center gap-2 text-[10px] text-(--color-text-faint)"
+                >
+                  <span className="shrink-0">#{fact.fact_rank}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono">{fact.fact_id}</span>
+                  <span>{fact.expanded_candidate_ids.length} 个原始候选</span>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex flex-wrap gap-1">
             {(analysis?.query_terms || []).map((term) => (
               <Badge key={term} tone="muted">
@@ -191,12 +217,14 @@ function TraceField({ label, value }: { label: string; value?: string }) {
 function CandidateTable({
   evalCase,
   items,
+  state,
   onMarkExpected,
   onOpenCandidate,
   markingExpected,
 }: {
   evalCase: RetrievalEvalCase
   items: RetrievalEvalRun['retrieved_items']
+  state: ReturnType<typeof evaluationCandidateState>
   onMarkExpected?: (
     item: RetrievalEvalRun['retrieved_items'][number],
     level: 'source' | 'chunk',
@@ -214,10 +242,10 @@ function CandidateTable({
           <LegendDot tone="miss" label="未命中期望" />
         </div>
       </div>
-      {items.length === 0 ? (
+      {state !== 'ready' ? (
         <div className="flex items-center justify-center gap-2 px-4 py-10 text-[12px] text-(--color-text-faint)">
           <Clock3 className="size-4" />
-          运行后展示候选来源
+          {state === 'not_run' ? '当前策略尚未运行' : '本次运行未召回候选'}
         </div>
       ) : (
         <div className="overflow-x-auto">
@@ -298,6 +326,11 @@ function CandidateTable({
                             {retrievalChannelLabel(channel)}
                           </Badge>
                         ))}
+                        {item.kg_matches.length > 0 && (
+                          <span className="text-[10px] text-(--color-text-faint)">
+                            {item.kg_matches.length} 个 fact
+                          </span>
+                        )}
                       </div>
                     </td>
                     <td className="px-3 py-2">

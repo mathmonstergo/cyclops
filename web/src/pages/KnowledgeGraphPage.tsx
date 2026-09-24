@@ -2,7 +2,6 @@ import { useMemo, useState, type ReactNode } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import {
   Ban,
-  Bot,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -17,7 +16,6 @@ import {
 import {
   useConfirmKgEntity,
   useConfirmKgRelation,
-  useCreateKgExtractionJob,
   useKgEntities,
   useKgRelations,
   useKgSubgraph,
@@ -37,14 +35,21 @@ import {
 } from '@/components/ui/drawer'
 import { DRAWER_WIDTH_COMPACT } from '@/components/ui/drawer-constants'
 import { Input } from '@/components/ui/input'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from '@/components/ui/toast'
 import { cn } from '@/lib/cn'
+import { useUi } from '@/store/ui'
+import { CopyIdButton } from './documents/copy-id-button'
+import { DocumentDrawer } from './documents/document-drawer'
+import { FaqDrawer } from './faqs/faq-drawer'
 import {
+  clampKgPage,
   confidencePercent,
   entityMatchesQuery,
+  evidenceSourceTarget,
   evidenceSummary,
+  kgCandidateConfirmBlockedReason,
+  kgRelationConfirmBlockedReason,
   kgReviewStatusLabel,
   kgStatusTone,
   relationMatchesQuery,
@@ -74,6 +79,7 @@ export default function KnowledgeGraphPage() {
   const [typeFilter, setTypeFilter] = useState('')
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<SelectedKgItem>(null)
+  const { openFaqId, setOpenFaqId, openImportFileId, setOpenImportFileId } = useUi()
   const offset = (page - 1) * PAGE_SIZE
 
   const entityQuery = useKgEntities({
@@ -98,15 +104,32 @@ export default function KnowledgeGraphPage() {
     [relationQuery.data?.items, query],
   )
 
-  const total = tab === 'entities' ? entityQuery.data?.total ?? 0 : relationQuery.data?.total ?? 0
+  const activeData = tab === 'entities' ? entityQuery.data : relationQuery.data
+  const total = activeData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const isPending = tab === 'entities' ? entityQuery.isPending : relationQuery.isPending
   const isError = tab === 'entities' ? entityQuery.isError : relationQuery.isError
   const isFetching = tab === 'entities' ? entityQuery.isFetching : relationQuery.isFetching
   const refetch = tab === 'entities' ? entityQuery.refetch : relationQuery.refetch
 
+  // 仅在当前查询已有真实响应时校正页码；pending 时不能把用户刚选择的新页误归零。
+  const clampedPage = clampKgPage(page, total, PAGE_SIZE)
+  if (activeData && clampedPage !== page) {
+    setPage(clampedPage)
+    setSelected(null)
+  }
+
   // 筛选变更时回到第一页；关键约束是保持当前 tab，不重置用户正在看的实体/关系类型。
-  const resetPage = () => setPage(1)
+  const resetPage = () => {
+    setPage(1)
+    setSelected(null)
+  }
+
+  // 翻页同时关闭旧详情，避免上一页记录在新查询期间保持可操作。
+  const changePage = (nextPage: number) => {
+    setPage(nextPage)
+    setSelected(null)
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -162,8 +185,6 @@ export default function KnowledgeGraphPage() {
         <Button variant="ghost" size="icon" onClick={() => refetch()} disabled={isFetching} title="刷新列表">
           {isFetching ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
         </Button>
-        <div className="ml-auto" />
-        <ExtractionJobPopover />
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto scroll-thin px-6 py-5">
@@ -212,12 +233,21 @@ export default function KnowledgeGraphPage() {
             total={total}
             pageSize={PAGE_SIZE}
             loading={isFetching}
-            onChange={setPage}
+            onChange={changePage}
           />
         )}
       </div>
 
       <KgDetailDrawer selected={selected} onClose={() => setSelected(null)} />
+      <FaqDrawer
+        faqId={openFaqId}
+        onClose={() => setOpenFaqId(null)}
+        onCreated={(id) => setOpenFaqId(id)}
+      />
+      <DocumentDrawer
+        fileId={openImportFileId}
+        onClose={() => setOpenImportFileId(null)}
+      />
     </div>
   )
 }
@@ -250,7 +280,7 @@ function EntityTable({
         <span>别名</span>
         <span>状态</span>
         <span>置信度</span>
-        <span>证据</span>
+        <span>有效来源</span>
         <span>更新时间</span>
       </div>
       <ul className="divide-y divide-(--color-border)">
@@ -278,7 +308,7 @@ function EntityTable({
                 <Badge tone={kgStatusTone(item.status)}>{kgReviewStatusLabel(item.status)}</Badge>
               </span>
               <span className="font-mono text-(--color-text)">{confidencePercent(item.confidence)}</span>
-              <span className="font-mono text-(--color-text-muted)">{item.evidence?.length ?? 0}</span>
+              <span className="font-mono text-(--color-text-muted)">{item.source_count}</span>
               <span className="font-mono text-(--color-text-faint)">{formatTime(item.updated_at)}</span>
             </button>
           </li>
@@ -315,7 +345,7 @@ function RelationTable({
         <span>关系</span>
         <span>尾实体</span>
         <span>状态</span>
-        <span>证据</span>
+        <span>有效证据</span>
         <span>更新时间</span>
       </div>
       <ul className="divide-y divide-(--color-border)">
@@ -337,7 +367,7 @@ function RelationTable({
               <span>
                 <Badge tone={kgStatusTone(item.status)}>{kgReviewStatusLabel(item.status)}</Badge>
               </span>
-              <span className="font-mono text-(--color-text-muted)">{item.evidence?.length ?? 0}</span>
+              <span className="font-mono text-(--color-text-muted)">{item.evidence_count}</span>
               <span className="font-mono text-(--color-text-faint)">{formatTime(item.updated_at)}</span>
             </button>
           </li>
@@ -385,7 +415,10 @@ function EntityDrawer({ item, onClose }: { item: KgEntity; onClose: () => void }
 
   const handleConfirm = async () => {
     try {
-      await confirm.mutateAsync(item.id)
+      await confirm.mutateAsync({
+        id: item.id,
+        expectedRevision: item.review_revision,
+      })
       toast.success('实体已确认并进入 KG 检索投影')
       onClose()
     } catch (error) {
@@ -434,7 +467,14 @@ function EntityDrawer({ item, onClose }: { item: KgEntity; onClose: () => void }
             <p className="text-[12px] text-(--color-text-muted)">确认实体后可查看已确认局部关系。</p>
           ) : subgraph.isPending ? (
             <Skeleton className="h-20 w-full" />
-          ) : subgraph.data?.edges.length ? (
+          ) : subgraph.isError ? (
+            <div className="flex items-center justify-between gap-3 text-[12px] text-(--color-danger)">
+              <span>加载局部关系失败。</span>
+              <Button size="sm" variant="outline" onClick={() => void subgraph.refetch()}>
+                重试
+              </Button>
+            </div>
+          ) : subgraph.data?.state === 'connected' ? (
             <div className="space-y-2">
               {subgraph.data.edges.slice(0, 8).map((edge) => {
                 const source = subgraph.data?.nodes.find((node) => node.id === edge.source)
@@ -454,8 +494,10 @@ function EntityDrawer({ item, onClose }: { item: KgEntity; onClose: () => void }
                 )
               })}
             </div>
-          ) : (
+          ) : subgraph.data?.state === 'isolated' ? (
             <p className="text-[12px] text-(--color-text-muted)">暂无已确认邻接关系。</p>
+          ) : (
+            <Skeleton className="h-20 w-full" />
           )}
         </DetailSection>
       </DrawerBody>
@@ -464,6 +506,7 @@ function EntityDrawer({ item, onClose }: { item: KgEntity; onClose: () => void }
         <ReviewActions
           status={item.status}
           pending={pending}
+          confirmBlockedReason={kgCandidateConfirmBlockedReason(item)}
           onConfirm={handleConfirm}
           onNeedsReview={() => handleStatus('needs_review')}
           onDisable={() => handleStatus('disabled')}
@@ -480,7 +523,10 @@ function RelationDrawer({ item, onClose }: { item: KgRelation; onClose: () => vo
 
   const handleConfirm = async () => {
     try {
-      await confirm.mutateAsync(item.id)
+      await confirm.mutateAsync({
+        id: item.id,
+        expectedRevision: item.review_revision,
+      })
       toast.success('关系已确认并进入 KG 检索投影')
       onClose()
     } catch (error) {
@@ -529,6 +575,7 @@ function RelationDrawer({ item, onClose }: { item: KgRelation; onClose: () => vo
         <ReviewActions
           status={item.status}
           pending={pending}
+          confirmBlockedReason={kgRelationConfirmBlockedReason(item)}
           onConfirm={handleConfirm}
           onNeedsReview={() => handleStatus('needs_review')}
           onDisable={() => handleStatus('disabled')}
@@ -542,20 +589,28 @@ function RelationDrawer({ item, onClose }: { item: KgRelation; onClose: () => vo
 function ReviewActions({
   status,
   pending,
+  confirmBlockedReason,
   onConfirm,
   onNeedsReview,
   onDisable,
 }: {
   status: string
   pending: boolean
+  confirmBlockedReason: string | null
   onConfirm: () => void
   onNeedsReview: () => void
   onDisable: () => void
 }) {
+  const canConfirm = confirmBlockedReason === null
   return (
     <div className="flex w-full items-center justify-end gap-2">
       {status !== 'usable' && (
-        <Button variant="primary" onClick={onConfirm} disabled={pending}>
+        <Button
+          variant="primary"
+          onClick={onConfirm}
+          disabled={pending || !canConfirm}
+          title={canConfirm ? '确认并投影为可检索 KG fact' : confirmBlockedReason}
+        >
           {pending ? <Loader2 className="size-3.5 animate-spin" /> : <CheckCircle2 className="size-3.5" />}
           确认
         </Button>
@@ -576,15 +631,47 @@ function ReviewActions({
   )
 }
 
-// 证据列表：所有 AI 抽取结果必须展示可追溯证据，不能只展示模型结论。
+// 证据历史：保留全部可追溯记录；失效来源只降级标识，不从历史数组中删除。
 function EvidenceList({ evidence }: { evidence: KgEvidence[] }) {
+  const { setOpenFaqId, setOpenImportFileId } = useUi()
+
+  // 证据只按后端精确 locator 打开已有来源抽屉，不从 ID 前缀或 metadata 推断。
+  const openEvidence = (item: KgEvidence) => {
+    const target = evidenceSourceTarget(item)
+    if (target?.kind === 'faq') {
+      setOpenFaqId(target.sourceId)
+      return
+    }
+    if (target?.kind === 'document') {
+      setOpenImportFileId(target.sourceId, target.sourceChunkId)
+    }
+  }
+
   return (
-    <DetailSection title={`证据列表 (${evidence.length})`}>
+    <DetailSection title={`证据历史 (${evidence.length})`}>
       {evidence.length ? (
         <div className="space-y-2">
           {evidence.map((item) => (
             <div key={item.id} className="rounded-(--radius-card) border border-(--color-border) bg-(--color-surface-2) px-3 py-2">
-              <div className="mb-1 text-[11px] text-(--color-text-faint)">{evidenceSummary(item)}</div>
+              <div className="mb-1 flex items-center gap-1 text-[11px] text-(--color-text-faint)">
+                <span className="min-w-0 flex-1 truncate">{evidenceSummary(item)}</span>
+                {!item.is_valid && (
+                  <span className="shrink-0 text-[10px] text-(--color-text-faint)">来源已失效</span>
+                )}
+                <CopyIdButton label="来源ID" value={item.source_id} />
+                {item.source_chunk_id && (
+                  <CopyIdButton label="切片ID" value={item.source_chunk_id} />
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 cursor-pointer px-2 text-[11px]"
+                  onClick={() => openEvidence(item)}
+                  disabled={!evidenceSourceTarget(item)}
+                >
+                  {item.source_type === 'faq' ? '查看 FAQ' : '查看切片'}
+                </Button>
+              </div>
               <p className="text-[12px] leading-[1.6] text-(--color-text-muted)">{item.excerpt}</p>
             </div>
           ))}
@@ -593,58 +680,6 @@ function EvidenceList({ evidence }: { evidence: KgEvidence[] }) {
         <p className="text-[12px] text-(--color-danger)">缺少证据，不建议确认。</p>
       )}
     </DetailSection>
-  )
-}
-
-// AI 抽取入口：用户手动输入已审核 FAQ ID 或文档切片 ID，后端只生成待审核候选。
-function ExtractionJobPopover() {
-  const createJob = useCreateKgExtractionJob()
-  const [sourceId, setSourceId] = useState('')
-
-  const handleSubmit = async () => {
-    if (!sourceId.trim()) {
-      toast.error('请输入来源 ID')
-      return
-    }
-    try {
-      const job = await createJob.mutateAsync({
-        source_id: sourceId.trim(),
-      })
-      toast.success(`抽取完成：${job.entity_count} 个实体，${job.relation_count} 条关系`)
-      setSourceId('')
-    } catch (error) {
-      toast.error((error as Error).message)
-    }
-  }
-
-  return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <Button variant="primary">
-          <Bot className="size-3.5" />
-          抽取候选
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-80 p-3">
-        <div className="space-y-3">
-          <div>
-            <div className="mb-1 text-[11px] text-(--color-text-faint)">来源 ID</div>
-            <Input
-              value={sourceId}
-              onChange={(event) => setSourceId(event.target.value)}
-              placeholder="输入 FAQ ID 或切片 ID"
-            />
-          </div>
-          <Button className="w-full" onClick={handleSubmit} disabled={createJob.isPending}>
-            {createJob.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Bot className="size-3.5" />}
-            开始抽取
-          </Button>
-          <p className="text-[11px] leading-[1.6] text-(--color-text-faint)">
-            输入 FAQ ID 或切片 ID，后端会自动识别来源；结果默认进入待审核。
-          </p>
-        </div>
-      </PopoverContent>
-    </Popover>
   )
 }
 

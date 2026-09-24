@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from cyclops.db.models import KgExpandedCandidate, KgFactHit, RetrievedKnowledgeChunk
+
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +77,129 @@ class QueryAnalysis:
 class FusedCandidate:
     """表示多路召回融合后的候选，保留来源通道和原始分数供调试。"""
 
-    document: Any
+    document: RetrievedKnowledgeChunk
     fused_score: float
     channels: tuple[str, ...]
     vector_score: float | None = None
     keyword_score: float | None = None
+    kg_score: float | None = None
+    kg_matches: tuple[KgFactHit, ...] = ()
+
+
+@dataclass(frozen=True)
+class HybridRetrievalResult:
+    """表示一次统一混合检索结果，候选与 parent 上下文必须分开保存。"""
+
+    query: str
+    query_terms: list[str]
+    vector_documents: list[RetrievedKnowledgeChunk]
+    keyword_documents: list[RetrievedKnowledgeChunk]
+    candidates: list[FusedCandidate]
+    parent_documents: list[RetrievedKnowledgeChunk]
+    kg_fact_hits: list[KgFactHit]
+    kg_expanded_candidates: list[KgExpandedCandidate]
+    candidate_limit: int
+    query_embedding_dimensions: int
+    rerank_used: bool
+
+
+class HybridRetrievalService:
+    """执行唯一混合检索流程，正式调用默认只融合向量与关键词候选。"""
+
+    def __init__(
+        self,
+        *,
+        database: Any,
+        embeddings: Any,
+        rerank: Any | None,
+        top_k: int,
+        min_score: float,
+    ) -> None:
+        """保存检索依赖与阈值，关键约束是所有入口复用同一组配置。"""
+        self.database = database
+        self.embeddings = embeddings
+        self.rerank = rerank
+        self.top_k = top_k
+        self.min_score = min_score
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        include_parent_context: bool,
+        use_kg: bool,
+    ) -> HybridRetrievalResult:
+        """召回并融合统一知识候选，KG 只能由调用方显式开启。"""
+        aliases = self.database.list_retrieval_aliases()
+        query_terms = build_keyword_terms(query, aliases)
+        query_embedding = self.embeddings.embed(query)
+        rerank_input_size = int(getattr(self.rerank, "input_size", 0) or 0)
+        candidate_limit = max(self.top_k * 2, self.top_k, rerank_input_size)
+        vector_documents = self.database.search_knowledge(
+            query_embedding,
+            top_k=candidate_limit,
+            min_score=self.min_score,
+        )
+        keyword_documents = self.database.search_knowledge_text(
+            query,
+            top_k=candidate_limit,
+            query_terms=query_terms,
+        )
+        kg_fact_hits: list[KgFactHit] = []
+        kg_expanded_candidates: list[KgExpandedCandidate] = []
+        if use_kg:
+            kg_fact_hits = self.database.search_kg_knowledge_text(
+                query,
+                top_k=candidate_limit,
+                query_terms=query_terms,
+            )
+            kg_expanded_candidates = self.database.expand_kg_fact_hits(kg_fact_hits)
+        fused_candidates = fuse_retrieval_candidates(
+            vector_docs=vector_documents,
+            keyword_docs=keyword_documents,
+            kg_candidates=kg_expanded_candidates if use_kg else None,
+            top_k=candidate_limit,
+        )
+        candidates, rerank_used = rerank_candidates(
+            query,
+            fused_candidates,
+            client=self.rerank,
+            top_k=self.top_k,
+        )
+        parent_documents: list[RetrievedKnowledgeChunk] = []
+        if include_parent_context:
+            child_ids = [
+                candidate.document.id
+                for candidate in candidates
+                if candidate.document.parent_chunk_id
+                and candidate.document.chunk_level != "parent"
+            ]
+            if child_ids:
+                candidate_ids = {candidate.document.id for candidate in candidates}
+                retrieved_parents = self.database.get_parent_context_chunks(child_ids)
+                if any(
+                    not isinstance(document, RetrievedKnowledgeChunk)
+                    for document in retrieved_parents
+                ):
+                    raise TypeError("parent context must contain RetrievedKnowledgeChunk")
+                parent_documents = [
+                    document
+                    for document in retrieved_parents
+                    if document.id not in candidate_ids
+                ]
+        return HybridRetrievalResult(
+            query=query,
+            query_terms=query_terms,
+            vector_documents=vector_documents,
+            keyword_documents=keyword_documents,
+            candidates=candidates,
+            parent_documents=parent_documents,
+            kg_fact_hits=kg_fact_hits,
+            kg_expanded_candidates=kg_expanded_candidates,
+            candidate_limit=candidate_limit,
+            query_embedding_dimensions=len(query_embedding),
+            rerank_used=rerank_used,
+        )
 
 
 @dataclass(frozen=True)
@@ -103,18 +223,24 @@ def analyze_query(question: str, chat: Any | None = None) -> QueryAnalysis:
 
 def fuse_retrieval_candidates(
     *,
-    vector_docs: Iterable[Any],
-    keyword_docs: Iterable[Any],
-    kg_docs: Iterable[Any] | None = None,
+    vector_docs: Iterable[RetrievedKnowledgeChunk],
+    keyword_docs: Iterable[RetrievedKnowledgeChunk],
+    kg_candidates: Iterable[KgExpandedCandidate] | None = None,
     top_k: int,
     rrf_k: int = 60,
 ) -> list[FusedCandidate]:
     """用 RRF 融合多路候选，关键约束是 KG 通道必须由调用方显式传入。"""
     candidates: dict[str, dict[str, Any]] = {}
 
-    def add_channel(docs: Iterable[Any], channel: str) -> None:
+    def add_channel(
+        docs: Iterable[RetrievedKnowledgeChunk],
+        channel: str,
+    ) -> None:
+        """加入 canonical 检索候选，禁止 dict 或旧 FAQ 对象双形状。"""
         for rank, doc in enumerate(docs, start=1):
-            doc_id = str(getattr(doc, "id", doc.get("id") if isinstance(doc, dict) else ""))
+            if not isinstance(doc, RetrievedKnowledgeChunk):
+                raise TypeError("retrieval candidate must be RetrievedKnowledgeChunk")
+            doc_id = doc.id
             item = candidates.setdefault(
                 doc_id,
                 {
@@ -123,21 +249,81 @@ def fuse_retrieval_candidates(
                     "channels": [],
                     "vector_score": None,
                     "keyword_score": None,
+                    "kg_score": None,
+                    "kg_rank": None,
+                    "kg_matches": {},
                 },
             )
             item["fused_score"] += 1.0 / (rrf_k + rank)
             if channel not in item["channels"]:
                 item["channels"].append(channel)
-            score = float(getattr(doc, "score", 0.0) or 0.0)
+            score = float(doc.score)
             if channel == "vector":
                 item["vector_score"] = score
             if channel == "keyword":
                 item["keyword_score"] = score
 
+    def add_kg_channel(candidates_to_add: Iterable[KgExpandedCandidate]) -> None:
+        """按原始知识行加入一次 KG RRF vote，并合并该行关联的 fact 诊断。"""
+        for candidate in candidates_to_add:
+            if not isinstance(candidate, KgExpandedCandidate):
+                raise TypeError("KG candidate must be KgExpandedCandidate")
+            if not isinstance(candidate.document, RetrievedKnowledgeChunk):
+                raise TypeError("KG expanded document must be RetrievedKnowledgeChunk")
+            if any(not isinstance(match, KgFactHit) for match in candidate.kg_matches):
+                raise TypeError("KG matches must be KgFactHit")
+            if not candidate.kg_matches:
+                raise ValueError("KG expanded candidate requires at least one fact match")
+            doc = candidate.document
+            doc_id = str(doc.id)
+            item = candidates.setdefault(
+                doc_id,
+                {
+                    "document": doc,
+                    "fused_score": 0.0,
+                    "channels": [],
+                    "vector_score": None,
+                    "keyword_score": None,
+                    "kg_score": None,
+                    "kg_rank": None,
+                    "kg_matches": {},
+                },
+            )
+            best_match = min(
+                candidate.kg_matches,
+                key=lambda match: (match.fact_rank, match.fact_chunk_id),
+            )
+            previous_rank = item["kg_rank"]
+            if previous_rank is None:
+                item["fused_score"] += 1.0 / (rrf_k + best_match.fact_rank)
+            elif best_match.fact_rank < previous_rank:
+                item["fused_score"] += 1.0 / (rrf_k + best_match.fact_rank)
+                item["fused_score"] -= 1.0 / (rrf_k + previous_rank)
+            item["kg_rank"] = (
+                best_match.fact_rank
+                if previous_rank is None
+                else min(previous_rank, best_match.fact_rank)
+            )
+            if "kg" not in item["channels"]:
+                item["channels"].append("kg")
+            if (
+                item["kg_score"] is None
+                or best_match.fact_rank < previous_rank
+                or (
+                    best_match.fact_rank == item["kg_rank"]
+                    and best_match.fact_score > item["kg_score"]
+                )
+            ):
+                item["kg_score"] = best_match.fact_score
+            for match in candidate.kg_matches:
+                existing = item["kg_matches"].get(match.fact_chunk_id)
+                if existing is None or match.fact_rank < existing.fact_rank:
+                    item["kg_matches"][match.fact_chunk_id] = match
+
     add_channel(vector_docs, "vector")
     add_channel(keyword_docs, "keyword")
-    if kg_docs is not None:
-        add_channel(kg_docs, "kg")
+    if kg_candidates is not None:
+        add_kg_channel(kg_candidates)
 
     fused = [
         FusedCandidate(
@@ -146,6 +332,13 @@ def fuse_retrieval_candidates(
             channels=tuple(item["channels"]),
             vector_score=item["vector_score"],
             keyword_score=item["keyword_score"],
+            kg_score=item["kg_score"],
+            kg_matches=tuple(
+                sorted(
+                    item["kg_matches"].values(),
+                    key=lambda match: (match.fact_rank, match.fact_chunk_id),
+                )
+            ),
         )
         for item in candidates.values()
     ]
@@ -166,26 +359,26 @@ def rerank_candidates(
     *,
     client: Any | None,
     top_k: int,
-) -> list[FusedCandidate]:
-    """对融合后的候选做 cross-encoder 重排，client=None 或候选不足时透传。
+) -> tuple[list[FusedCandidate], bool]:
+    """对融合候选执行 cross-encoder 重排，并返回结果与是否实际采用排名。
 
-    关键约束：调用失败、client 缺失、候选数 ≤ top_k 时不影响主链路；
-    取前 input_size 候选送 rerank，按 relevance_score 排序后截到 top_k。
+    关键约束：只有至少一个合法 index 真正进入结果时才标记已重排；provider
+    返回不足时按原融合顺序补齐，调用失败或无有效排名则完整保留原顺序。
     """
     if not candidates:
-        return []
+        return [], False
     if client is None or len(candidates) <= top_k:
-        return candidates[:top_k]
+        return candidates[:top_k], False
     input_size = int(getattr(client, "input_size", len(candidates)) or len(candidates))
     payload = candidates[:input_size]
     documents = [_extract_candidate_text(candidate) for candidate in payload]
     try:
-        results = client.rerank(query, documents, top_n=top_k)
+        results = client.rerank(query, documents, top_n=min(top_k, len(payload)))
     except Exception as exc:
         logger.warning("rerank_candidates failed: %s", exc, exc_info=True)
-        return candidates[:top_k]
+        return candidates[:top_k], False
     if not results:
-        return candidates[:top_k]
+        return candidates[:top_k], False
     ordered: list[FusedCandidate] = []
     seen: set[int] = set()
     for item in results:
@@ -197,20 +390,23 @@ def rerank_candidates(
         if len(ordered) >= top_k:
             break
     if not ordered:
-        return candidates[:top_k]
-    return ordered
+        return candidates[:top_k], False
+    if len(ordered) < top_k:
+        for index, candidate in enumerate(candidates):
+            if index in seen:
+                continue
+            ordered.append(candidate)
+            if len(ordered) >= top_k:
+                break
+    return ordered[:top_k], True
 
 
 def _extract_candidate_text(candidate: FusedCandidate) -> str:
-    """从候选里提取 rerank 用的文本，优先 content，回退 question+answer。"""
+    """读取 canonical content 作为 rerank 文本，不接受旧 FAQ 字段回退。"""
     document = candidate.document
-    content = getattr(document, "content", None)
-    if content:
-        return str(content)
-    question = getattr(document, "question", None) or ""
-    answer = getattr(document, "answer", None) or ""
-    combined = f"{question}\n{answer}".strip()
-    return combined or str(getattr(document, "id", ""))
+    if not isinstance(document, RetrievedKnowledgeChunk):
+        raise TypeError("rerank candidate document must be RetrievedKnowledgeChunk")
+    return document.content
 
 
 def build_keyword_terms(question: str, aliases: Iterable[dict[str, Any]] | None = None) -> list[str]:

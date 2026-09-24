@@ -1,6 +1,6 @@
 // 智能问答 SSE 客户端：fetch ReadableStream + `\n\n` 分块 + JSON data 解析 + AbortSignal 支持。
 // 后端事件契约：admin_server.py:format_sse_event → `event: <type>\ndata: <json>\n\n`，data 内 type 字段与事件类型一致。
-import { ApiError } from '@/api/client'
+import { ApiError } from '../api/client.ts'
 import type { AssistantSource, AssistantStreamPayload } from '@/api/schemas'
 
 export interface AssistantMetaEvent {
@@ -77,11 +77,11 @@ export async function streamAssistantChat({
     try {
       const text = await res.text()
       if (text) {
-        const json = JSON.parse(text) as { error?: { message?: string } }
-        if (json?.error?.message) message = json.error.message
+        const json = JSON.parse(text) as { error?: unknown }
+        if (typeof json.error === 'string' && json.error.trim()) message = json.error
       }
     } catch {
-      // 非 JSON 错误体，沿用默认文案
+      // 非 JSON 错误体只能显示 HTTP 状态，不能伪造业务原因。
     }
     throw new ApiError(message, res.status, 'http_error')
   }

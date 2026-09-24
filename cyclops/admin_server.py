@@ -1,39 +1,49 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-import mimetypes
-import os
 import re
 import sys
 import threading
 import time
-import traceback
 import uuid
 
 import requests
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from cyclops.ai_assist import AiAssistant, AiSuggestionError
-from cyclops.chunking import normalize_children_delimiter, split_with_pattern
 from cyclops.config import DOCUMENT_CHUNKER_TYPES, Settings
 from cyclops.db import (
     Database,
+    KgExpandedCandidate,
+    KgFactHit,
+    KgReviewConflictError,
+    RETRIEVAL_EVAL_BASELINE_STRATEGY,
+    RETRIEVAL_EVAL_CONTRACT_VERSION,
+    RETRIEVAL_EVAL_KG_DEBUG_STRATEGY,
+    RetrievedKnowledgeChunk,
     build_document_knowledge_chunk_row,
-    build_faq_knowledge_chunk_row,
     build_import_candidate_faq_row,
+    document_embedding_source_fingerprint,
+)
+from cyclops.db.builders import child_knowledge_chunk_index, document_child_sources
+from cyclops.document_kg import (
+    localize_document_kg_map_result,
+    premerge_document_kg_map_results,
+    reduce_document_kg,
 )
 from cyclops.document_parser import (
     MINERU_BATCH_FILE_URL,
     MINERU_BATCH_RESULT_URL_TEMPLATE,
     MineruClient,
     MineruParseError,
+    ParsedBlock,
     build_import_chunks_from_blocks,
     extract_blocks_from_mineru_payload,
 )
@@ -41,6 +51,7 @@ from cyclops.import_dedupe import compare_candidate_duplicate
 from cyclops.import_ai import ImportAiAssistant, ImportCandidateError
 from cyclops.import_questions import ImportQuestionAssistant, ImportQuestionError
 from cyclops.import_models import detect_file_type
+from cyclops.kg import build_faq_kg_source_text
 from cyclops.kg_ai import KnowledgeGraphAiAssistant
 from cyclops.llm import ChatClient, EmbeddingClient, RerankClient, build_openai_client
 from cyclops.markdown_import import chunk_messages, parse_wechat_messages
@@ -51,11 +62,11 @@ from cyclops.rag import (
 )
 from cyclops.retrieval import (
     EvalCaseResult,
+    FusedCandidate,
+    HybridRetrievalService,
+    QueryAnalysis,
     analyze_query,
-    build_keyword_terms,
     compute_retrieval_metrics,
-    fuse_retrieval_candidates,
-    rerank_candidates,
 )
 
 
@@ -65,6 +76,10 @@ class AdminValidationError(ValueError):
 
 class AdminNotFoundError(KeyError):
     pass
+
+
+class AdminConflictError(RuntimeError):
+    """当前资源已在审核期间变化时抛出，统一映射为 HTTP 409。"""
 
 
 class AdminPayloadTooLargeError(ValueError):
@@ -90,25 +105,16 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 REMOTE_ADMIN_ENV = "ALLOW_REMOTE_ADMIN"
 
 VALID_FAQ_STATUSES = {"usable", "needs_review", "disabled"}
-VALID_IMPORT_PARSE_MODES = {"by_days", "by_gap"}
-VALID_KG_EXTRACTION_SOURCE_TYPES = {"faq", "document_chunk"}
-VALID_KG_REVIEW_STATUSES = {"usable", "needs_review", "disabled"}
+VALID_KG_STATUS_UPDATES = {"needs_review", "disabled"}
 
 
 def normalize_document_chunker_type(value: Any, *, default: str = "naive") -> str:
-    """规范化文档 chunker 名称；关键约束是未知路线必须显式报错，不能静默降级。"""
-    selected = str(value if value is not None else default).strip().lower()
-    if not selected:
-        selected = str(default or "naive").strip().lower() or "naive"
-    if selected not in DOCUMENT_CHUNKER_TYPES:
+    """选择文档 chunker；显式值必须是 canonical 枚举，只有缺省输入使用默认值。"""
+    selected = default if value is None else value
+    if not isinstance(selected, str) or selected not in DOCUMENT_CHUNKER_TYPES:
         allowed = ", ".join(sorted(DOCUMENT_CHUNKER_TYPES))
         raise AdminValidationError(f"chunker_type must be one of: {allowed}")
     return selected
-RETRIEVAL_EVAL_STRATEGY = "retrieval_hybrid_v1"
-RETRIEVAL_EVAL_KG_DEBUG_STRATEGY = "retrieval_hybrid_v1_kg_debug"
-DOCUMENT_CHILD_INDEX_OFFSET = 1
-
-
 def split_text_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -159,18 +165,6 @@ def merge_existing_faq_metadata(payload: dict[str, Any], existing: dict[str, Any
     return merged
 
 
-def normalize_import_parse_options(payload: dict[str, Any]) -> dict[str, Any]:
-    """规范化导入解析参数，天数范围固定在 1 到 7 天。"""
-    parse_mode = str(payload.get("parse_mode", "by_days")).strip() or "by_days"
-    if parse_mode not in VALID_IMPORT_PARSE_MODES:
-        raise AdminValidationError("parse_mode must be by_days or by_gap")
-    try:
-        chunk_days = int(payload.get("chunk_days", 1))
-    except (TypeError, ValueError) as exc:
-        raise AdminValidationError("chunk_days must be an integer") from exc
-    return {"parse_mode": parse_mode, "chunk_days": min(max(chunk_days, 1), 7)}
-
-
 def normalize_retrieval_eval_case_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """规范化检索评测用例，关键约束是问题和期望命中口径必须可执行。"""
     question = str(payload.get("question", "")).strip()
@@ -201,33 +195,6 @@ def normalize_retrieval_alias_payload(payload: dict[str, Any]) -> dict[str, Any]
         "tags": split_text_list(payload.get("tags")),
         "status": str(payload.get("status", "active") or "active").strip() or "active",
     }
-
-
-def _normalize_parse_progress(value: Any) -> dict[str, Any]:
-    """规范化解析进度字段，兼容数据库 JSONB 和旧字符串记录。"""
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return {"state": value.strip()}
-        if isinstance(parsed, dict):
-            return parsed
-    return {}
-
-
-def _state_from_import_status(status: Any) -> str:
-    """把导入文件状态映射为前端轮询状态，避免页面理解 FAQ 审核状态。"""
-    mapping = {
-        "pending": "pending",
-        "processing": "running",
-        "needs_review": "done",
-        "completed": "done",
-        "failed": "failed",
-        "unsupported": "unsupported",
-    }
-    return mapping.get(str(status or "pending"), "pending")
 
 
 def _parse_progress_percent(progress: dict[str, Any]) -> int:
@@ -326,6 +293,12 @@ def settings_payload_to_env(payload: dict[str, Any]) -> dict[str, str]:
         "ASSISTANT_MAX_CONCURRENT_STREAMS": str(
             payload.get("assistant_max_concurrent_streams", "")
         ).strip(),
+        "IMPORT_PARSE_WORKER_POLL_INTERVAL_SECONDS": str(
+            payload.get("import_parse_worker_poll_interval_seconds", "")
+        ).strip(),
+        "IMPORT_PARSE_WORKER_LEASE_SECONDS": str(
+            payload.get("import_parse_worker_lease_seconds", "")
+        ).strip(),
         "RERANK_BASE_URL": str(payload.get("rerank_base_url", "")).strip(),
         "RERANK_API_KEY": str(payload.get("rerank_api_key", "")).strip(),
         "RERANK_MODEL": str(payload.get("rerank_model", "")).strip(),
@@ -370,6 +343,10 @@ def settings_to_tenant_settings(settings: Settings) -> dict[str, Any]:
         "embedding_timeout_seconds": settings.embedding_timeout_seconds,
         "rerank_timeout_seconds": settings.rerank_timeout_seconds,
         "assistant_max_concurrent_streams": settings.assistant_max_concurrent_streams,
+        "import_parse_worker_poll_interval_seconds": (
+            settings.import_parse_worker_poll_interval_seconds
+        ),
+        "import_parse_worker_lease_seconds": settings.import_parse_worker_lease_seconds,
         "rerank_base_url": settings.rerank_base_url,
         "rerank_api_key": settings.rerank_api_key,
         "rerank_model": settings.rerank_model,
@@ -462,6 +439,8 @@ def classify_error_response(exc: Exception) -> tuple[HTTPStatus, dict[str, Any]]
     """
     if isinstance(exc, AdminNotFoundError):
         return HTTPStatus.NOT_FOUND, {"error": str(exc)}
+    if isinstance(exc, AdminConflictError):
+        return HTTPStatus.CONFLICT, {"error": str(exc)}
     if isinstance(exc, AdminPayloadTooLargeError):
         return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
     if isinstance(exc, AdminValidationError | AiSuggestionError | ImportCandidateError):
@@ -534,111 +513,123 @@ def parse_sse_event(content: str) -> dict[str, Any]:
     return {"event": event_name, "data": data}
 
 
-def assistant_document_payload(doc: Any) -> dict[str, Any]:
-    """把检索命中文档转换成智能问答调试抽屉使用的来源结构。"""
-    metadata = getattr(doc, "metadata", {}) or {}
+def assistant_document_payload(doc: RetrievedKnowledgeChunk) -> dict[str, Any]:
+    """把 canonical 检索文档转换为问答来源结构，不接受旧对象形状。"""
+    if not isinstance(doc, RetrievedKnowledgeChunk):
+        raise TypeError("assistant document must be RetrievedKnowledgeChunk")
+    metadata = doc.metadata
+    category = metadata.get("category") or doc.source_type
+    source_date = metadata.get("source_date")
     return {
         "id": doc.id,
-        "source_type": getattr(doc, "source_type", "faq"),
-        "source_id": getattr(doc, "source_id", doc.id),
-        "source_chunk_id": getattr(doc, "source_chunk_id", None),
-        "parent_chunk_id": getattr(doc, "parent_chunk_id", None),
-        "chunk_level": getattr(doc, "chunk_level", "chunk"),
-        "source_title": getattr(doc, "source_title", getattr(doc, "question", "")),
-        "section_path": getattr(doc, "section_path", metadata.get("section_path", [])),
-        "page_start": getattr(doc, "page_start", metadata.get("page_start")),
-        "page_end": getattr(doc, "page_end", metadata.get("page_end")),
-        "block_type": getattr(doc, "block_type", metadata.get("block_type")),
-        "source_offsets": getattr(doc, "source_offsets", metadata.get("source_offsets", {})),
-        "content": getattr(doc, "content", getattr(doc, "answer", "")),
+        "source_type": doc.source_type,
+        "source_id": doc.source_id,
+        "source_chunk_id": doc.source_chunk_id,
+        "parent_chunk_id": doc.parent_chunk_id,
+        "chunk_level": doc.chunk_level,
+        "source_title": doc.source_title,
+        "section_path": doc.section_path,
+        "page_start": doc.page_start,
+        "page_end": doc.page_end,
+        "block_type": doc.block_type,
+        "source_offsets": doc.source_offsets,
+        "content": doc.content,
         "metadata": metadata,
         "score": doc.score,
-        "question": doc.question,
-        "answer": doc.answer,
-        "category": doc.category,
+        "question": doc.source_title or doc.source_id,
+        "answer": doc.content,
+        "category": str(category) if category else None,
         "tags": doc.tags,
-        "source_date": doc.source_date,
+        "source_date": str(source_date) if source_date else None,
         "confidence": doc.confidence,
         "status": doc.status,
     }
 
 
-def parent_context_documents(database: Any, docs: list[Any]) -> list[Any]:
-    """命中 child 文档时读取 parent 上下文，关键约束是不重复追加已有命中。"""
-    child_ids = [
-        str(getattr(doc, "id"))
-        for doc in docs
-        if getattr(doc, "parent_chunk_id", None) and getattr(doc, "chunk_level", "") != "parent"
-    ]
-    if not child_ids:
-        return []
-    getter = getattr(database, "get_parent_context_chunks", None)
-    if getter is None:
-        return []
-    existing_ids = {str(getattr(doc, "id", "")) for doc in docs}
-    return [doc for doc in getter(child_ids) if str(getattr(doc, "id", "")) not in existing_ids]
-
-
-def retrieval_eval_item_payload(candidate: Any) -> dict[str, Any]:
-    """把融合候选转换为评测运行可回放结构，关键约束是带可读来源字段。"""
+def retrieval_eval_item_payload(candidate: FusedCandidate) -> dict[str, Any]:
+    """序列化正式评测候选，关键约束是只接受具备完整 ID 的 FAQ/文档来源。"""
+    if not isinstance(candidate, FusedCandidate):
+        raise TypeError("retrieval eval item must be FusedCandidate")
     doc = candidate.document
+    if not isinstance(doc, RetrievedKnowledgeChunk):
+        raise TypeError("retrieval eval document must be RetrievedKnowledgeChunk")
+    if doc.source_type not in {"faq", "document"}:
+        raise ValueError("retrieval eval source_type must be faq or document")
+    if (
+        not isinstance(doc.id, str)
+        or not doc.id.strip()
+        or not isinstance(doc.source_id, str)
+        or not doc.source_id.strip()
+    ):
+        raise ValueError("retrieval eval candidate requires non-empty id and source_id")
     return {
-        "id": getattr(doc, "id", ""),
-        "source_id": getattr(doc, "source_id", ""),
-        "source_type": getattr(doc, "source_type", ""),
-        "source_chunk_id": getattr(doc, "source_chunk_id", None),
-        "parent_chunk_id": getattr(doc, "parent_chunk_id", None),
-        "chunk_level": getattr(doc, "chunk_level", None),
-        "source_title": getattr(doc, "source_title", None),
-        "section_path": getattr(doc, "section_path", None),
-        "page_start": getattr(doc, "page_start", None),
-        "page_end": getattr(doc, "page_end", None),
-        "block_type": getattr(doc, "block_type", None),
-        "content": getattr(doc, "content", None),
-        "metadata": getattr(doc, "metadata", None),
-        "question": getattr(doc, "question", None),
-        "answer": getattr(doc, "answer", None),
-        "category": getattr(doc, "category", None),
-        "tags": getattr(doc, "tags", None),
+        "id": doc.id,
+        "source_id": doc.source_id,
+        "source_type": doc.source_type,
+        "source_chunk_id": doc.source_chunk_id,
+        "parent_chunk_id": doc.parent_chunk_id,
+        "chunk_level": doc.chunk_level,
+        "source_title": doc.source_title,
+        "section_path": doc.section_path,
+        "page_start": doc.page_start,
+        "page_end": doc.page_end,
+        "block_type": doc.block_type,
+        "content": doc.content,
         "channels": list(candidate.channels),
         "fused_score": candidate.fused_score,
         "vector_score": candidate.vector_score,
         "keyword_score": candidate.keyword_score,
+        "kg_score": candidate.kg_score,
+        "kg_matches": [kg_fact_hit_payload(match) for match in candidate.kg_matches],
     }
 
 
+def kg_fact_hit_payload(hit: KgFactHit) -> dict[str, Any]:
+    """序列化 KG fact 命中，关键约束是保留合成 ID 仅作调试诊断。"""
+    return {
+        "fact_chunk_id": hit.fact_chunk_id,
+        "fact_id": hit.fact_id,
+        "fact_type": hit.fact_type,
+        "fact_rank": hit.fact_rank,
+        "fact_score": hit.fact_score,
+    }
+
+
+def kg_fact_analysis_payload(
+    fact_hits: list[KgFactHit],
+    kg_candidates: list[KgExpandedCandidate],
+) -> list[dict[str, Any]]:
+    """整理 fact 到原始候选的展开诊断，孤儿 fact 明确保留空候选列表。"""
+    expanded_ids = {hit.fact_chunk_id: [] for hit in fact_hits}
+    for candidate in kg_candidates:
+        for match in candidate.kg_matches:
+            candidate_ids = expanded_ids.get(match.fact_chunk_id)
+            if candidate_ids is None:
+                raise ValueError(
+                    f"unknown KG fact match: {match.fact_chunk_id}"
+                )
+            if candidate.document.id not in candidate_ids:
+                candidate_ids.append(candidate.document.id)
+    return [
+        {
+            **kg_fact_hit_payload(hit),
+            "expanded_candidate_ids": expanded_ids[hit.fact_chunk_id],
+        }
+        for hit in fact_hits
+    ]
+
+
 def document_knowledge_rows_for_embedding(chunk: dict[str, Any], import_file: dict[str, Any]) -> list[dict[str, Any]]:
-    """把审核切片转换为 RAGFlow 风格 parent/child 知识单元。"""
+    """生成文档 parent/child，与状态统计共用唯一 child 来源选择器。"""
     parent_row = build_document_knowledge_chunk_row(
         {**chunk, "retrieval_status": "usable", "chunk_level": "parent"},
         import_file,
+        knowledge_chunk_id=chunk["id"],
     )
-    delimiter_children = delimiter_child_chunks(chunk)
-    if delimiter_children:
-        return _child_rows_from_texts(chunk, import_file, parent_row, delimiter_children)
-
-    blocks = structured_source_blocks(chunk.get("source_blocks"))
-    if len(blocks) <= 1:
-        return [parent_row]
-
-    return _child_rows_from_blocks(chunk, import_file, parent_row, blocks)
-
-
-def child_knowledge_chunk_index(parent_index: int, child_index: int) -> int:
-    """为 child 知识单元生成负数 chunk_index，关键约束是不与 parent 正编号冲突。"""
-    parent = max(int(parent_index), 0)
-    child = max(int(child_index), 0)
-    paired = (parent + child) * (parent + child + 1) // 2 + child
-    return -(paired + DOCUMENT_CHILD_INDEX_OFFSET)
-
-
-def delimiter_child_chunks(chunk: dict[str, Any]) -> list[str]:
-    """按 RAGFlow children_delimiter 规则拆分 parent 正文，单段结果不重复建 child。"""
-    pattern = normalize_children_delimiter(chunk.get("children_delimiter"))
-    if not pattern:
-        return []
-    children = split_with_pattern(str(chunk.get("source_text") or ""), pattern)
-    return children if len(children) > 1 else []
+    child_texts, child_blocks = document_child_sources(chunk)
+    if child_blocks:
+        return _child_rows_from_blocks(chunk, import_file, parent_row, child_blocks)
+    return _child_rows_from_texts(chunk, import_file, parent_row, child_texts)
 
 
 def _child_rows_from_texts(
@@ -647,13 +638,12 @@ def _child_rows_from_texts(
     parent_row: dict[str, Any],
     child_texts: list[str],
 ) -> list[dict[str, Any]]:
-    """从 delimiter 子段生成 child rows，并用 parent_content 对齐 RAGFlow mom_with_weight。"""
+    """从文本子段生成 child，合成 ID 只用于知识行而不改写来源切片 ID。"""
     rows = [parent_row]
     parent_index = int(chunk.get("chunk_index", 0))
     for child_index, child_text in enumerate(child_texts, start=1):
         child_chunk = {
             **chunk,
-            "id": f"{chunk['id']}_child_{child_index}",
             "source_text": child_text,
             "source_blocks": [],
             "chunk_index": child_knowledge_chunk_index(parent_index, child_index),
@@ -662,7 +652,13 @@ def _child_rows_from_texts(
             "parent_content": parent_row["content"],
             "retrieval_status": "usable",
         }
-        rows.append(build_document_knowledge_chunk_row(child_chunk, import_file))
+        rows.append(
+            build_document_knowledge_chunk_row(
+                child_chunk,
+                import_file,
+                knowledge_chunk_id=f"{chunk['id']}_child_{child_index}",
+            )
+        )
     return rows
 
 
@@ -672,7 +668,7 @@ def _child_rows_from_blocks(
     parent_row: dict[str, Any],
     blocks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """从结构化 source_blocks 生成 child rows，用于无 children_delimiter 的默认精确召回。"""
+    """从结构块生成 child，合成 ID 只用于知识行而不改写来源切片 ID。"""
     rows = [parent_row]
     parent_index = int(chunk.get("chunk_index", 0))
     for child_index, block in enumerate(blocks, start=1):
@@ -683,7 +679,6 @@ def _child_rows_from_blocks(
         child_chunk = {
             **chunk,
             **child_meta,
-            "id": f"{chunk['id']}_child_{child_index}",
             "source_text": block_text,
             "source_blocks": [block],
             "chunk_index": child_knowledge_chunk_index(parent_index, child_index),
@@ -692,20 +687,14 @@ def _child_rows_from_blocks(
             "parent_content": parent_row["content"],
             "retrieval_status": "usable",
         }
-        rows.append(build_document_knowledge_chunk_row(child_chunk, import_file))
+        rows.append(
+            build_document_knowledge_chunk_row(
+                child_chunk,
+                import_file,
+                knowledge_chunk_id=f"{chunk['id']}_child_{child_index}",
+            )
+        )
     return rows
-
-
-def structured_source_blocks(value: Any) -> list[dict[str, Any]]:
-    """读取解析器来源块，关键约束是不从审核正文反向解析结构。"""
-    if isinstance(value, str) and value.strip():
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(value, list):
-        return []
-    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def structured_block_metadata(block: dict[str, Any], parent_chunk: dict[str, Any]) -> dict[str, Any]:
@@ -770,6 +759,7 @@ class AdminApp:
     chat: ChatClient | None = None
     rerank: RerankClient | None = None
     rerank_resolved: bool = False
+    retrieval: HybridRetrievalService | None = None
     assistant_stream_semaphore: threading.BoundedSemaphore | None = None
     settings_file: Path = Path("data/settings.local.json")
     tenant_id: str = "default"
@@ -874,6 +864,18 @@ class AdminApp:
             self.rerank_resolved = True
         return self.rerank
 
+    def hybrid_retrieval_service(self) -> HybridRetrievalService:
+        """获取唯一混合检索服务，并复用 AdminApp 管理的 DB、embedding 与 rerank。"""
+        if self.retrieval is None:
+            self.retrieval = HybridRetrievalService(
+                database=self.database(),
+                embeddings=self.embedding_client(),
+                rerank=self.rerank_client(),
+                top_k=getattr(self.settings, "rag_top_k", 5),
+                min_score=getattr(self.settings, "rag_min_score", 0.35),
+            )
+        return self.retrieval
+
     def assistant_system_prompt(self) -> str:
         """读取智能问答系统提示词；未配置时返回空值，不再注入代码硬编码提示。"""
         try:
@@ -930,6 +932,16 @@ class AdminApp:
                 "assistant_max_concurrent_streams",
                 4,
             ),
+            "import_parse_worker_poll_interval_seconds": getattr(
+                self.settings,
+                "import_parse_worker_poll_interval_seconds",
+                1.0,
+            ),
+            "import_parse_worker_lease_seconds": getattr(
+                self.settings,
+                "import_parse_worker_lease_seconds",
+                60,
+            ),
             "rerank_base_url": self.settings.rerank_base_url,
             "rerank_api_key": mask_setting_secret(self.settings.rerank_api_key),
             "rerank_api_key_configured": bool(self.settings.rerank_api_key),
@@ -938,13 +950,29 @@ class AdminApp:
         }
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """保存设置页配置到本地租户文件，关键约束是缺失字段沿用当前运行值。"""
+        """保存租户设置，并精确失效受变更配置影响的运行对象。"""
         merged_payload = merge_settings_payload_preserving_blank_secrets(
             settings_to_tenant_settings(self.settings),
             payload,
         )
         env_values = settings_payload_to_env(merged_payload)
         next_settings = Settings.from_env(env_values)
+        database_config_changed = (
+            self.settings.database_url,
+            self.settings.db_pool_min_size,
+            self.settings.db_pool_max_size,
+        ) != (
+            next_settings.database_url,
+            next_settings.db_pool_min_size,
+            next_settings.db_pool_max_size,
+        )
+        stream_limit_changed = (
+            self.settings.assistant_max_concurrent_streams
+            != next_settings.assistant_max_concurrent_streams
+        )
+        if database_config_changed and self.db is not None:
+            self.db.close()
+            self.db = None
         write_tenant_settings(
             self.settings_file,
             settings_to_tenant_settings(next_settings),
@@ -955,8 +983,9 @@ class AdminApp:
         self.chat = None
         self.rerank = None
         self.rerank_resolved = False
-        if self.db is not None and getattr(self.db, "database_url", None) != self.settings.database_url:
-            self.db = None
+        self.retrieval = None
+        if stream_limit_changed:
+            self.assistant_stream_semaphore = None
         return self.settings_snapshot()
 
     def list_faqs(self, params: dict[str, list[str]]) -> dict[str, Any]:
@@ -988,7 +1017,7 @@ class AdminApp:
 
     def list_retrieval_aliases(self) -> dict[str, Any]:
         """列出启用检索别名，供接口和关键词扩展复用。"""
-        rows = self._retrieval_aliases()
+        rows = self.database().list_retrieval_aliases()
         return {"items": rows, "total": len(rows)}
 
     def save_retrieval_alias(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -999,46 +1028,36 @@ class AdminApp:
     def run_retrieval_eval_case(
         self,
         case_id: str,
-        payload: dict[str, Any] | None = None,
+        payload: dict[str, Any],
     ) -> dict[str, Any]:
         """运行单条检索评测，关键约束是 KG 召回必须由 use_kg 显式开启。"""
+        if not isinstance(payload, dict):
+            raise AdminValidationError("retrieval eval payload must be a JSON object")
+        if payload == {}:
+            use_kg = False
+        elif set(payload) == {"use_kg"} and payload["use_kg"] is True:
+            use_kg = True
+        else:
+            raise AdminValidationError(
+                "retrieval eval payload must be {} or contain exactly use_kg=true"
+            )
         case = self.database().get_retrieval_eval_case(case_id)
         if case is None:
             raise AdminNotFoundError(f"Retrieval eval case not found: {case_id}")
 
-        payload = payload or {}
-        use_kg = self._bool_payload(payload, "use_kg", False)
         question = str(case["question"]).strip()
         analysis = analyze_query(question, self.chat_client())
         query = analysis.query_rewrite or question
         top_k = getattr(self.settings, "rag_top_k", 5)
-        min_score = getattr(self.settings, "rag_min_score", 0.35)
-        candidate_limit = max(top_k * 2, top_k)
-        aliases = self._retrieval_aliases()
-        query_terms = build_keyword_terms(query, aliases)
-        query_embedding = self.embedding_client().embed(query)
-        vector_docs = self.database().search_knowledge(
-            query_embedding,
-            top_k=candidate_limit,
-            min_score=min_score,
-        )
-        keyword_docs = self.database().search_knowledge_text(
+        retrieval_result = self.hybrid_retrieval_service().retrieve(
             query,
-            top_k=candidate_limit,
-            query_terms=query_terms,
+            include_parent_context=False,
+            use_kg=use_kg,
         )
-        kg_docs = []
-        if use_kg:
-            search_kg = getattr(self.database(), "search_kg_knowledge_text", None)
-            if search_kg is not None:
-                kg_docs = search_kg(query, top_k=candidate_limit, query_terms=query_terms)
-        fused = fuse_retrieval_candidates(
-            vector_docs=vector_docs,
-            keyword_docs=keyword_docs,
-            kg_docs=kg_docs if use_kg else None,
-            top_k=top_k,
-        )
-        retrieved_items = [retrieval_eval_item_payload(candidate) for candidate in fused]
+        retrieved_items = [
+            retrieval_eval_item_payload(candidate)
+            for candidate in retrieval_result.candidates
+        ]
         expected_ids = split_text_list(case.get("expected_chunk_ids")) or split_text_list(
             case.get("expected_source_ids")
         )
@@ -1058,33 +1077,60 @@ class AdminApp:
         )
         row = {
             "case_id": case_id,
-            "strategy": RETRIEVAL_EVAL_KG_DEBUG_STRATEGY if use_kg else RETRIEVAL_EVAL_STRATEGY,
+            "strategy": (
+                RETRIEVAL_EVAL_KG_DEBUG_STRATEGY
+                if use_kg
+                else RETRIEVAL_EVAL_BASELINE_STRATEGY
+            ),
             "retrieved_items": retrieved_items,
             "metrics": metrics,
             "analysis": {
+                "contract_version": RETRIEVAL_EVAL_CONTRACT_VERSION,
                 **analysis.to_dict(),
-                "query_terms": query_terms,
-                "vector_count": len(vector_docs),
-                "keyword_count": len(keyword_docs),
-                "kg_count": len(kg_docs),
+                "query_terms": retrieval_result.query_terms,
+                "vector_count": len(retrieval_result.vector_documents),
+                "keyword_count": len(retrieval_result.keyword_documents),
+                "kg_fact_count": len(retrieval_result.kg_fact_hits),
+                "kg_expanded_candidate_count": len(
+                    retrieval_result.kg_expanded_candidates
+                ),
+                "kg_facts": kg_fact_analysis_payload(
+                    retrieval_result.kg_fact_hits,
+                    retrieval_result.kg_expanded_candidates,
+                ),
                 "use_kg": use_kg,
+                "candidate_limit": retrieval_result.candidate_limit,
+                "rerank_used": retrieval_result.rerank_used,
             },
         }
         return self.database().record_retrieval_eval_run(row)
 
     def kg_subgraph(self, params: dict[str, list[str]]) -> dict[str, Any]:
-        """读取局部知识图谱，关键约束是默认只看 usable 且限制返回规模。"""
+        """读取 usable 子图，严格拒绝 status 等非当前查询字段。"""
+        allowed_fields = {
+            "center_entity_id",
+            "hops",
+            "entity_type",
+            "relation_type",
+            "limit",
+        }
+        unsupported_fields = set(params).difference(allowed_fields)
+        if unsupported_fields:
+            fields = ", ".join(sorted(unsupported_fields))
+            raise AdminValidationError(f"unsupported KG subgraph query fields: {fields}")
         center_entity_id = str(params.get("center_entity_id", [""])[0]).strip()
         if not center_entity_id:
             raise AdminValidationError("center_entity_id is required")
-        return self.database().get_kg_subgraph(
+        result = self.database().get_kg_subgraph(
             center_entity_id=center_entity_id,
             hops=min(max(self._int_param(params, "hops", 1), 1), 2),
             entity_types=split_text_list(params.get("entity_type", [""])[0]),
             relation_types=split_text_list(params.get("relation_type", [""])[0]),
-            status=params.get("status", ["usable"])[0] or "usable",
             limit=min(max(self._int_param(params, "limit", 80), 1), 200),
         )
+        if result is None:
+            raise AdminNotFoundError(f"KG center entity not found: {center_entity_id}")
+        return result
 
     def list_kg_entities(self, params: dict[str, list[str]]) -> dict[str, Any]:
         """列出 KG 实体审核候选，关键约束是只做筛选分页不修改状态。"""
@@ -1104,19 +1150,47 @@ class AdminApp:
             offset=max(self._int_param(params, "offset", 0), 0),
         )
 
-    def confirm_kg_entity(self, entity_id: str) -> dict[str, Any]:
-        """确认 KG 实体，关键约束是确认后才投影为可检索 KG chunk。"""
+    def confirm_kg_entity(
+        self,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """确认 KG 实体；关键约束是只确认调用方实际审核的 revision。"""
+        expected_revision = self._kg_expected_revision(payload)
         try:
-            return {"item": self.database().confirm_kg_entity(entity_id)}
+            return {
+                "item": self.database().confirm_kg_entity(
+                    entity_id,
+                    expected_revision=expected_revision,
+                )
+            }
         except KeyError as exc:
             raise AdminNotFoundError(str(exc)) from exc
+        except KgReviewConflictError as exc:
+            raise AdminConflictError(str(exc)) from exc
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
 
-    def confirm_kg_relation(self, relation_id: str) -> dict[str, Any]:
-        """确认 KG 关系，关键约束是确认后才投影为可检索 KG chunk。"""
+    def confirm_kg_relation(
+        self,
+        relation_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """确认 KG 关系；关键约束是只确认调用方实际审核的 revision。"""
+        expected_revision = self._kg_expected_revision(payload)
         try:
-            return {"item": self.database().confirm_kg_relation(relation_id)}
+            return {
+                "item": self.database().confirm_kg_relation(
+                    relation_id,
+                    expected_revision=expected_revision,
+                )
+            }
         except KeyError as exc:
             raise AdminNotFoundError(str(exc)) from exc
+        except KgReviewConflictError as exc:
+            raise AdminConflictError(str(exc)) from exc
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
 
     def set_kg_entity_status(self, entity_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """更新 KG 实体审核状态，关键约束是状态枚举受控。"""
@@ -1126,6 +1200,18 @@ class AdminApp:
         except KeyError as exc:
             raise AdminNotFoundError(str(exc)) from exc
 
+    @staticmethod
+    def _kg_expected_revision(payload: dict[str, Any]) -> int:
+        """读取唯一确认 payload；关键约束是必须且只能包含正整数 expected_revision。"""
+        if set(payload) != {"expected_revision"}:
+            raise AdminValidationError(
+                "KG confirm payload must contain exactly expected_revision"
+            )
+        value = payload["expected_revision"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise AdminValidationError("expected_revision must be a positive integer")
+        return value
+
     def set_kg_relation_status(self, relation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """更新 KG 关系审核状态，关键约束是状态枚举受控。"""
         status = self._kg_review_status(payload)
@@ -1134,152 +1220,197 @@ class AdminApp:
         except KeyError as exc:
             raise AdminNotFoundError(str(exc)) from exc
 
-    def create_kg_extraction_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """创建并同步执行 KG 抽取任务，关键约束是只生成待审核候选。"""
-        source_type = str(payload.get("source_type") or "").strip()
-        source_id = str(payload.get("source_id") or "").strip()
-        if not source_id:
-            raise AdminValidationError("source_id is required")
-        if source_type and source_type not in VALID_KG_EXTRACTION_SOURCE_TYPES:
-            raise AdminValidationError("source_type must be faq or document_chunk")
-        if not source_type:
-            source_type = self._infer_kg_extraction_source_type(source_id)
+    def queue_faq_kg_extraction_job(
+        self,
+        faq_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """要求严格空对象并创建 FAQ 资源级 queued job。"""
+        self._require_empty_kg_job_payload(payload)
+        try:
+            return self.database().create_faq_kg_extraction_job(
+                faq_id,
+                model=str(getattr(self.settings, "chat_model", "") or ""),
+            )
+        except KeyError as exc:
+            raise AdminNotFoundError(str(exc)) from exc
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
 
-        chat = self.chat_client()
-        job = self.database().create_kg_extraction_job(
-            {
-                "source_type": source_type,
-                "source_id": source_id,
-                "source_chunk_id": source_id if source_type == "document_chunk" else None,
-                "model": str(getattr(chat, "model", "") or getattr(self.settings, "chat_model", "") or ""),
-            }
+    def queue_document_kg_extraction_job(
+        self,
+        file_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """要求严格空对象并创建整篇文档父任务与 manifest items。"""
+        self._require_empty_kg_job_payload(payload)
+        try:
+            return self.database().create_document_kg_extraction_job(
+                file_id,
+                model=str(getattr(self.settings, "chat_model", "") or ""),
+            )
+        except KeyError as exc:
+            raise AdminNotFoundError(str(exc)) from exc
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
+
+    def get_latest_faq_kg_extraction_job(
+        self,
+        faq_id: str,
+    ) -> dict[str, Any] | None:
+        """读取 FAQ 最近一次公开 job DTO，不接受其他来源类型。"""
+        return self.database().get_latest_kg_extraction_job(
+            source_type="faq",
+            source_id=faq_id,
         )
+
+    def get_latest_document_kg_extraction_job(
+        self,
+        file_id: str,
+    ) -> dict[str, Any] | None:
+        """读取整篇文档最近一次公开 job DTO，不接受 chunk ID。"""
+        return self.database().get_latest_kg_extraction_job(
+            source_type="document",
+            source_id=file_id,
+        )
+
+    def get_kg_extraction_job(self, job_id: str) -> dict[str, Any]:
+        """读取 KG 抽取任务，关键约束是不存在的任务映射为管理端 404。"""
+        job = self.database().get_kg_extraction_job(job_id)
+        if job is None:
+            raise AdminNotFoundError(f"KG extraction job not found: {job_id}")
+        return job
+
+    def process_kg_extraction_job_step(self, job: dict[str, Any]) -> dict[str, Any]:
+        """按已 claim source_type/phase 推进一步；一次调用至多一次 Chat。"""
+        database = self.database()
+        job_id = job["id"]
+        lease_token = job["lease_token"]
+        source_type = job["source_type"]
+        phase = job["phase"]
         try:
-            self.database().update_kg_extraction_job(job["id"], status="processing", error=None)
-        except Exception:
-            logger.warning("Failed to update KG extraction job to processing: %s", job["id"], exc_info=True)
-        try:
-            source_text, source = self._kg_extraction_source(source_type, source_id)
-            extraction = KnowledgeGraphAiAssistant(chat).extract(source_text=source_text, source=source)
-            counts = self.database().save_kg_extraction_candidates(extraction)
+            if source_type == "faq" and phase == "mapping":
+                faq = database.get_faq(job["source_id"])
+                if faq is None:
+                    raise ValueError(f"FAQ KG source is missing: {job['source_id']}")
+                if faq.get("status") != "usable":
+                    raise ValueError("FAQ KG source must remain usable")
+                source_text = build_faq_kg_source_text(faq)
+                source = {
+                    "source_type": "faq",
+                    "source_id": faq["id"],
+                    "source_chunk_id": None,
+                    "source_title": faq.get("question"),
+                    "section_path": [],
+                    "page_start": None,
+                    "page_end": None,
+                }
+                extraction = KnowledgeGraphAiAssistant(self.chat_client()).extract(
+                    source_text=source_text,
+                    source=source,
+                )
+                return database.complete_faq_kg_extraction_job(
+                    job_id,
+                    lease_token=lease_token,
+                    extraction=extraction,
+                )
+
+            if source_type == "document" and phase == "mapping":
+                item = database.load_document_kg_map_item(
+                    job_id,
+                    lease_token=lease_token,
+                )
+                if item is None:
+                    raise ValueError("document KG mapping job has no pending Map item")
+                extraction = KnowledgeGraphAiAssistant(self.chat_client()).extract(
+                    source_text=item["source_text"],
+                    source=item["source"],
+                )
+                map_result = localize_document_kg_map_result(
+                    extraction,
+                    job_id=job_id,
+                    chunk_id=item["chunk_id"],
+                    chunk_order=item["chunk_order"],
+                )
+                return database.complete_document_kg_map_item(
+                    job_id,
+                    item["id"],
+                    lease_token=lease_token,
+                    map_result=map_result,
+                )
+
+            if source_type == "document" and phase == "resolving":
+                map_results = database.load_document_kg_map_results(
+                    job_id,
+                    lease_token=lease_token,
+                )
+                premerged = premerge_document_kg_map_results(map_results)
+                if len(premerged["entities"]) <= 1:
+                    resolution = {"groups": []}
+                else:
+                    resolution = KnowledgeGraphAiAssistant(
+                        self.chat_client()
+                    ).resolve_document_entities(entities=premerged["entities"])
+                return database.save_document_kg_resolution(
+                    job_id,
+                    lease_token=lease_token,
+                    resolution_result=resolution,
+                )
+
+            if source_type == "document" and phase == "reducing":
+                map_results = database.load_document_kg_map_results(
+                    job_id,
+                    lease_token=lease_token,
+                )
+                premerged = premerge_document_kg_map_results(map_results)
+                extraction = reduce_document_kg(
+                    premerged,
+                    job["resolution_result"],
+                )
+                return database.complete_document_kg_extraction_job(
+                    job_id,
+                    lease_token=lease_token,
+                    extraction=extraction,
+                )
+
+            raise ValueError(
+                f"unsupported KG extraction step: {source_type}/{phase}"
+            )
         except Exception as exc:
             try:
-                return self.database().update_kg_extraction_job(
-                    job["id"],
-                    status="failed",
+                return database.fail_kg_extraction_job(
+                    job_id,
+                    lease_token=lease_token,
                     error=str(exc)[:1000],
                 )
             except Exception:
                 logger.error(
-                    "Failed to update KG extraction job to failed: %s", job["id"], exc_info=True
+                    "Failed to update KG extraction job to failed: %s",
+                    job_id,
+                    exc_info=True,
                 )
                 raise
-        try:
-            return self.database().update_kg_extraction_job(
-                job["id"],
-                status="completed",
-                entity_count=counts["entity_count"],
-                relation_count=counts["relation_count"],
-                evidence_count=counts["evidence_count"],
-                error=None,
-            )
-        except Exception:
-            logger.error(
-                "KG extraction data saved but failed to update job %s to completed", job["id"],
-                exc_info=True,
-            )
-            try:
-                return self.database().update_kg_extraction_job(
-                    job["id"],
-                    status="failed",
-                    error="data saved but status update failed",
-                )
-            except Exception:
-                logger.critical(
-                    "Cannot update KG extraction job %s at all", job["id"], exc_info=True
-                )
-                raise
-
-    def _infer_kg_extraction_source_type(self, source_id: str) -> str:
-        """根据来源 ID 自动识别 KG 抽取类型，关键约束是只在前端未显式传类型时使用。"""
-        faq = self.database().get_faq(source_id)
-        if faq is not None:
-            return "faq"
-        chunk = self.database().get_import_chunk(source_id)
-        if chunk is not None:
-            return "document_chunk"
-        raise AdminNotFoundError(f"KG extraction source not found: {source_id}")
-
-    def _kg_extraction_source(self, source_type: str, source_id: str) -> tuple[str, dict[str, Any]]:
-        """读取 KG 抽取来源，关键约束是只允许已审核 FAQ 或未禁用文档切片。"""
-        if source_type == "faq":
-            faq = self.database().get_faq(source_id)
-            if faq is None:
-                raise AdminNotFoundError(f"FAQ not found: {source_id}")
-            if faq.get("status") != "usable":
-                raise AdminValidationError("FAQ must be usable before KG extraction")
-            source_text = self._faq_kg_source_text(faq)
-            return source_text, {
-                "source_type": "faq",
-                "source_id": faq["id"],
-                "source_chunk_id": None,
-                "source_title": faq.get("question"),
-            }
-        chunk = self.database().get_import_chunk(source_id)
-        if chunk is None:
-            raise AdminNotFoundError(f"Import chunk not found: {source_id}")
-        if chunk.get("is_disabled"):
-            raise AdminValidationError("disabled import chunk cannot be used for KG extraction")
-        source_text = str(chunk.get("source_text") or "").strip()
-        if not source_text:
-            raise AdminValidationError("import chunk source_text is required")
-        record = self.database().get_import_file(chunk["file_id"])
-        source_title = record.get("original_name") if record else chunk.get("file_id")
-        return source_text, {
-            "source_type": "document",
-            "source_id": chunk["file_id"],
-            "source_chunk_id": chunk["id"],
-            "source_title": source_title,
-            "section_path": list(chunk.get("section_path") or []),
-            "page_start": chunk.get("page_start"),
-            "page_end": chunk.get("page_end"),
-        }
 
     @staticmethod
-    def _faq_kg_source_text(faq: dict[str, Any]) -> str:
-        """把 FAQ 整理为 KG 抽取文本，关键约束是保留问题、答案、分类和标签。"""
-        parts = [f"问题：{faq.get('question') or ''}", f"答案：{faq.get('answer') or ''}"]
-        if faq.get("category"):
-            parts.append(f"分类：{faq['category']}")
-        tags = split_text_list(faq.get("tags"))
-        if tags:
-            parts.append(f"标签：{'，'.join(tags)}")
-        return "\n".join(part for part in parts if part.strip())
-
-    def _retrieval_aliases(self) -> list[dict[str, Any]]:
-        """读取启用别名词典；测试替身未实现该方法时返回空列表。"""
-        list_aliases = getattr(self.database(), "list_retrieval_aliases", None)
-        if list_aliases is None:
-            return []
-        return list_aliases()
+    def _require_empty_kg_job_payload(payload: dict[str, Any]) -> None:
+        """校验资源级 KG 排队 payload；只允许显式 JSON 空对象。"""
+        if not isinstance(payload, dict) or payload:
+            raise AdminValidationError("KG extraction payload must be an empty object")
 
     @staticmethod
     def _kg_review_status(payload: dict[str, Any]) -> str:
-        """读取 KG 审核状态，关键约束是只接受三态审核枚举。"""
-        status = str(payload.get("status") or "").strip()
-        if status not in VALID_KG_REVIEW_STATUSES:
-            raise AdminValidationError("status must be usable, needs_review, or disabled")
+        """读取 KG 状态，关键约束是只含 status 且 usable 只能走显式 confirm。"""
+        if set(payload) != {"status"}:
+            raise AdminValidationError("KG review payload must contain exactly status")
+        raw_status = payload["status"]
+        if not isinstance(raw_status, str):
+            raise AdminValidationError("status must be a string")
+        status = raw_status.strip()
+        if status == "usable":
+            raise AdminValidationError("usable status requires the confirm endpoint")
+        if status not in VALID_KG_STATUS_UPDATES:
+            raise AdminValidationError("status must be needs_review or disabled")
         return status
-
-    @staticmethod
-    def _bool_payload(payload: dict[str, Any], key: str, default: bool) -> bool:
-        """读取布尔 payload 字段，关键约束是兼容前端字符串和真实布尔值。"""
-        value = payload.get(key)
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -1498,26 +1629,36 @@ class AdminApp:
         return {"count": len(rows), "items": rows}
 
     def embed_faq(self, faq_id: str) -> dict[str, Any]:
-        """为 FAQ 生成向量，并同步投影到统一知识单元表。"""
-        row = self.get_faq(faq_id)
+        """按当前内容指纹生成 FAQ 向量，并由数据库原子刷新统一投影。"""
         try:
-            embedding_client = self.embedding_client()
+            row = self.database().prepare_faq_embedding(faq_id)
+        except KeyError as exc:
+            raise AdminNotFoundError(str(exc)) from exc
+        content_hash = row.get("content_hash")
+        if not isinstance(content_hash, str) or not content_hash:
+            raise AdminValidationError("FAQ content hash is required before embedding")
+        embedding_client = self.embedding_client()
+        try:
             vector = embedding_client.embed(row["embedding_text"])
-            updated = self.database().update_faq_embedding(
+        except Exception as exc:
+            try:
+                return self.database().mark_embedding_failed(
+                    faq_id,
+                    str(exc),
+                    expected_content_hash=content_hash,
+                )
+            except ValueError as conflict:
+                raise AdminValidationError(str(conflict)) from conflict
+        try:
+            return self.database().update_faq_embedding(
                 faq_id,
                 vector,
                 embedding_model=embedding_client.model,
                 embedding_dimensions=embedding_client.dimensions,
+                expected_content_hash=content_hash,
             )
-            self.database().upsert_knowledge_chunk(
-                build_faq_knowledge_chunk_row(updated),
-                vector,
-                embedding_model=embedding_client.model,
-                embedding_dimensions=embedding_client.dimensions,
-            )
-            return updated
-        except Exception as exc:
-            return self.database().mark_embedding_failed(faq_id, str(exc))
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
 
     def embed_pending(self, payload: dict[str, Any]) -> dict[str, Any]:
         limit = min(max(int(payload.get("limit", 50)), 1), 200)
@@ -1536,13 +1677,43 @@ class AdminApp:
         return AiAssistant(self.chat_client()).optimize(question, answer).to_dict()
 
     def list_import_files(self, params: dict[str, list[str]]) -> dict[str, Any]:
-        """列出导入文件，供导入审核左栏使用。"""
-        return self.database().list_import_files(
+        """列出导入文件，并把数据库最新任务整理成不含 lease 的只读 DTO。"""
+        result = self.database().list_import_files(
             query=params.get("query", [""])[0],
             status=params.get("status", [""])[0] or None,
             limit=min(max(int(params.get("limit", ["50"])[0]), 1), 100),
             offset=max(int(params.get("offset", ["0"])[0]), 0),
         )
+        return {
+            **result,
+            "items": [
+                {
+                    **item,
+                    "parse_job": (
+                        self._import_parse_job_payload(item["parse_job"])
+                        if item["parse_job"] is not None
+                        else None
+                    ),
+                }
+                for item in result["items"]
+            ],
+        }
+
+    def get_import_file(self, file_id: str) -> dict[str, Any]:
+        """读取文件与最新持久解析任务；关键约束是 GET 不访问 provider。"""
+        record = self.database().get_import_file(file_id)
+        if record is None:
+            raise AdminNotFoundError(f"Import file not found: {file_id}")
+        job = self.database().get_latest_import_parse_job_for_file(file_id)
+        return {
+            "file": {
+                **record,
+                "embedding_summary": self.database().get_import_file_embedding_summary(
+                    file_id
+                ),
+            },
+            "parse_job": self._import_parse_job_payload(job) if job is not None else None,
+        }
 
     def create_import_file(
         self,
@@ -1580,35 +1751,38 @@ class AdminApp:
                 "status": status,
             }
         )
-        if not auto_parse:
-            return record
-        if parser == "markdown_chat":
-            return self._parse_markdown_import(record, content)
-        if parser == "mineru":
-            return self._parse_mineru_import(record, stored_path)
+        if auto_parse and parser in {"markdown_chat", "mineru"}:
+            job = self.start_import_parse_job(
+                file_id,
+                {"chunker_type": selected_chunker},
+            )
+            return {**record, "status": "processing", "parse_job": job}
         return record
 
-    def _parse_markdown_import(
+    def _build_markdown_import_chunks(
         self,
-        record: dict[str, Any],
+        file_id: str,
         content: bytes,
-        *,
-        parse_mode: str = "by_days",
-        chunk_days: int = 1,
-    ) -> dict[str, Any]:
-        """解析 Markdown 微信聊天记录，生成可追溯时间切块。"""
+    ) -> list[dict[str, Any]]:
+        """把 UTF-8 微信 Markdown 构造成当前导入切片，不执行数据库写入。"""
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
-            self.database().update_import_file_summary(record["id"], status="failed", error="文件必须是 UTF-8 编码")
             raise AdminValidationError("uploaded Markdown must be UTF-8") from exc
         messages = parse_wechat_messages(text)
-        chunks = chunk_messages(messages, mode=parse_mode, days=chunk_days)
-        chunk_rows = [
+        chunks = chunk_messages(messages, mode="by_days", days=1)
+        return [
             {
                 "id": f"chunk_{uuid.uuid4().hex[:12]}",
-                "file_id": record["id"],
+                "file_id": file_id,
                 "chunk_index": index,
+                "section_path": [],
+                "page_start": None,
+                "page_end": None,
+                "block_type": "chat_turns",
+                "source_offsets": {},
+                "source_blocks": [],
+                "children_delimiter": "",
                 "start_at": chunk.start_at,
                 "end_at": chunk.end_at,
                 "message_count": chunk.message_count,
@@ -1619,44 +1793,6 @@ class AdminApp:
             }
             for index, chunk in enumerate(chunks, start=1)
         ]
-        self.database().replace_import_chunks(record["id"], chunk_rows)
-        summary = self.database().update_import_file_summary(
-            record["id"],
-            status="needs_review",
-            message_count=len(messages),
-            chunk_count=len(chunk_rows),
-            candidate_count=0,
-            error=None,
-        )
-        return {**record, **summary}
-
-    def _parse_mineru_import(self, record: dict[str, Any], stored_path: Path) -> dict[str, Any]:
-        """调用 MinerU 解析上传文件，并生成导入审核切块。"""
-        try:
-            blocks = self._mineru_client(record["id"]).parse_file(stored_path)
-            chunk_rows = self._build_document_import_chunks(
-                record["id"],
-                blocks,
-                chunker_type=self._document_chunker_type_from_record(record),
-            )
-        except MineruParseError as exc:
-            self.database().update_import_file_summary(
-                record["id"],
-                status="failed",
-                error=str(exc),
-            )
-            raise AdminValidationError(f"MinerU parse failed: {exc}") from exc
-
-        self.database().replace_import_chunks(record["id"], chunk_rows)
-        summary = self.database().update_import_file_summary(
-            record["id"],
-            status="needs_review",
-            message_count=0,
-            chunk_count=len(chunk_rows),
-            candidate_count=0,
-            error=None,
-        )
-        return {**record, **summary}
 
     def _mineru_client(self, import_file_id: str | None = None) -> MineruClient:
         """创建 MinerU 客户端，关键约束是资产按导入文件隔离存储。"""
@@ -1673,145 +1809,191 @@ class AdminApp:
         )
 
     def start_import_parse_job(self, file_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """提交文档解析任务，关键约束是 MinerU 长任务不在请求内同步等待。"""
+        """只创建 queued 解析任务，provider 调用统一由持久 worker 执行。"""
+        if set(payload) != {"chunker_type"}:
+            raise AdminValidationError("parse job body must contain only chunker_type")
         record = self.database().get_import_file(file_id)
         if record is None:
             raise AdminNotFoundError(f"Import file not found: {file_id}")
-        if record.get("parser") == "markdown_chat":
-            parsed = self.reparse_import_file(file_id, payload)
-            return self._import_parse_status_payload(parsed, state="done", progress={"state": "done"})
-        if record.get("parser") != "mineru":
-            raise AdminValidationError("only MinerU files can start parse jobs")
+        if record["parser"] not in {"markdown_chat", "mineru"}:
+            raise AdminValidationError("only Markdown chat or MinerU files can be parsed")
+        chunker_type = payload["chunker_type"]
+        if not isinstance(chunker_type, str) or chunker_type not in DOCUMENT_CHUNKER_TYPES:
+            allowed = ", ".join(sorted(DOCUMENT_CHUNKER_TYPES))
+            raise AdminValidationError(f"chunker_type must be one of: {allowed}")
         stored_path = Path(record["stored_path"])
-        if not stored_path.exists():
+        if not stored_path.exists() or not stored_path.is_file():
             raise AdminValidationError("stored upload file is missing")
-        chunker_update = self._document_chunker_update_from_payload(record, payload)
+        input_fingerprint = self._import_parse_input_fingerprint(
+            record,
+            stored_path,
+            chunker_type=chunker_type,
+        )
+        try:
+            job = self.database().create_import_parse_job(
+                file_id,
+                chunker_type=chunker_type,
+                input_fingerprint=input_fingerprint,
+            )
+        except ValueError as exc:
+            if "active import parse job" in str(exc):
+                raise AdminConflictError(str(exc)) from exc
+            raise AdminValidationError(str(exc)) from exc
+        return self._import_parse_job_payload(job)
 
-        status = self._mineru_client(record["id"]).start_file(stored_path)
-        progress = self._mineru_progress_payload(status)
-        summary_fields = {
-            "status": "processing",
-            "parse_batch_id": status.batch_id,
-            "parse_file_name": status.file_name,
-            "parse_progress": progress,
-            "error": None,
-        }
-        if chunker_update is not None:
-            summary_fields["chunker_type"] = chunker_update
-        summary = self.database().update_import_file_summary(file_id, **summary_fields)
-        return self._import_parse_status_payload({**record, **summary}, state=status.state, progress=progress)
+    def get_import_parse_job(self, job_id: str) -> dict[str, Any]:
+        """按 ID 只读持久解析任务；关键约束是读取不推进 provider。"""
+        job = self.database().get_import_parse_job(job_id)
+        if job is None:
+            raise AdminNotFoundError(f"Import parse job not found: {job_id}")
+        return self._import_parse_job_payload(job)
 
-    def get_import_parse_status(self, file_id: str) -> dict[str, Any]:
-        """查询文档解析状态；完成时落盘切片，进行中时只更新进度。"""
-        record = self.database().get_import_file(file_id)
+    def process_import_parse_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        """推进一个已领取任务；业务阶段只以数据库 job 状态为真相。"""
+        job_id = job["id"]
+        lease_token = job["lease_token"]
+        if not isinstance(lease_token, str) or not lease_token:
+            raise ValueError("claimed import parse job requires lease_token")
+        try:
+            return self._process_import_parse_job_claim(job, lease_token=lease_token)
+        except Exception as exc:
+            error = (str(exc).strip() or exc.__class__.__name__)[:1000]
+            try:
+                return self.database().fail_import_parse_job(
+                    job_id,
+                    lease_token=lease_token,
+                    error=error,
+                )
+            except Exception:
+                logger.exception("failed to persist import parse job error: %s", job_id)
+                raise
+
+    def _process_import_parse_job_claim(
+        self,
+        job: dict[str, Any],
+        *,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """按 submitting/polling/finalizing 三阶段推进当前 claim。"""
+        record = self.database().get_import_file(job["file_id"])
         if record is None:
-            raise AdminNotFoundError(f"Import file not found: {file_id}")
-        if record.get("parser") != "mineru" or record.get("status") != "processing":
-            return self._import_parse_status_payload(record)
+            raise AdminNotFoundError(f"Import file not found: {job['file_id']}")
+        stored_path = Path(record["stored_path"])
+        if not stored_path.exists() or not stored_path.is_file():
+            raise AdminValidationError("stored upload file is missing")
+        live_fingerprint = self._import_parse_input_fingerprint(
+            record,
+            stored_path,
+            chunker_type=job["chunker_type"],
+        )
+        if live_fingerprint != job["input_fingerprint"]:
+            raise AdminConflictError("import parse input fingerprint changed")
 
-        batch_id = str(record.get("parse_batch_id") or "").strip()
-        file_name = str(record.get("parse_file_name") or record.get("original_name") or "").strip()
-        if not batch_id or not file_name:
-            return self._import_parse_status_payload(record)
+        if job["status"] == "submitting":
+            if record["parser"] == "markdown_chat":
+                chunks = self._build_markdown_import_chunks(
+                    record["id"],
+                    stored_path.read_bytes(),
+                )
+                return self.database().complete_import_parse_job(
+                    job["id"],
+                    lease_token=lease_token,
+                    input_fingerprint=self._import_parse_input_fingerprint(
+                        record,
+                        stored_path,
+                        chunker_type=job["chunker_type"],
+                    ),
+                    chunks=chunks,
+                    progress={"state": "completed", "percent": 100},
+                )
+            if record["parser"] != "mineru":
+                raise AdminValidationError("unsupported import parser")
+            status = self._mineru_client(record["id"]).start_file(stored_path)
+            return self.database().update_import_parse_job_progress(
+                job["id"],
+                lease_token=lease_token,
+                status="polling",
+                progress=self._mineru_progress_payload(status),
+                provider_batch_id=status.batch_id,
+                provider_file_name=status.file_name,
+                next_poll_at=self._next_import_parse_poll_at(),
+            )
 
+        if job["status"] not in {"polling", "finalizing"}:
+            raise ValueError(f"unsupported import parse job status: {job['status']}")
+        batch_id = job["provider_batch_id"]
+        file_name = job["provider_file_name"]
+        if not isinstance(batch_id, str) or not batch_id:
+            raise ValueError("polling import parse job requires provider_batch_id")
+        if not isinstance(file_name, str) or not file_name:
+            raise ValueError("polling import parse job requires provider_file_name")
         status = self._mineru_client(record["id"]).get_task_status(batch_id, file_name)
         progress = self._mineru_progress_payload(status)
-        if status.state in {"done", "finished", "success", "completed"}:
-            return self._finish_mineru_parse_job(record, status, progress)
-        if status.state in {"failed", "error", "cancelled", "canceled"}:
-            summary = self.database().update_import_file_summary(
-                file_id,
-                status="failed",
-                parse_progress=progress,
-                error=status.error or "MinerU parse failed",
+        provider_state = str(status.state).lower()
+        if provider_state in {"failed", "error", "cancelled", "canceled"}:
+            raise MineruParseError(status.error or "MinerU parse failed")
+        if provider_state not in {"done", "finished", "success", "completed"}:
+            if job["status"] == "finalizing":
+                raise MineruParseError("MinerU finalizing result is not ready")
+            return self.database().update_import_parse_job_progress(
+                job["id"],
+                lease_token=lease_token,
+                status="polling",
+                progress=progress,
+                provider_batch_id=batch_id,
+                provider_file_name=file_name,
+                next_poll_at=self._next_import_parse_poll_at(),
             )
-            return self._import_parse_status_payload({**record, **summary}, state=status.state, progress=progress)
-
-        summary = self.database().update_import_file_summary(
-            file_id,
-            status="processing",
-            parse_progress=progress,
-            error=None,
+        finalizing_job = self.database().begin_import_parse_job_finalization(
+            job["id"],
+            lease_token=lease_token,
+            progress=progress,
         )
-        return self._import_parse_status_payload({**record, **summary}, state=status.state, progress=progress)
-
-    def _finish_mineru_parse_job(self, record: dict[str, Any], status: Any, progress: dict[str, Any]) -> dict[str, Any]:
-        """处理 MinerU 完成状态，下载结果并替换文档切片。"""
-        try:
-            payload = self._mineru_client(record["id"]).download_task_result(status)
-            blocks = extract_blocks_from_mineru_payload(
-                payload,
-                source_file=record.get("original_name") or status.file_name,
-                use_kb_packager=getattr(self.settings, "mineru_use_kb_packager", True),
-            )
-            chunk_rows = self._build_document_import_chunks(
-                record["id"],
-                blocks,
-                chunker_type=self._document_chunker_type_from_record(record),
-            )
-        except MineruParseError as exc:
-            summary = self.database().update_import_file_summary(
-                record["id"],
-                status="failed",
-                parse_progress=progress,
-                error=str(exc),
-            )
-            return self._import_parse_status_payload({**record, **summary}, state="failed", progress=progress)
-
-        self.database().replace_import_chunks(record["id"], chunk_rows)
-        summary = self.database().update_import_file_summary(
+        payload = self._mineru_client(record["id"]).download_task_result(status)
+        blocks = extract_blocks_from_mineru_payload(
+            payload,
+            source_file=record["original_name"],
+            use_kb_packager=getattr(self.settings, "mineru_use_kb_packager", True),
+        )
+        chunks = self._build_document_import_chunks(
             record["id"],
-            status="needs_review",
-            message_count=0,
-            chunk_count=len(chunk_rows),
-            candidate_count=0,
-            parse_progress=progress,
-            error=None,
+            blocks,
+            chunker_type=finalizing_job["chunker_type"],
         )
-        return self._import_parse_status_payload({**record, **summary}, state=status.state, progress=progress)
+        completed_progress = {**progress, "state": "completed", "percent": 100}
+        return self.database().complete_import_parse_job(
+            job["id"],
+            lease_token=lease_token,
+            input_fingerprint=self._import_parse_input_fingerprint(
+                record,
+                stored_path,
+                chunker_type=finalizing_job["chunker_type"],
+            ),
+            chunks=chunks,
+            progress=completed_progress,
+        )
 
     def _build_document_import_chunks(
         self,
         file_id: str,
-        blocks: list[Any],
+        blocks: list[ParsedBlock],
         *,
-        chunker_type: str | None = None,
+        chunker_type: str,
     ) -> list[dict[str, Any]]:
-        """按显式 RAGFlow 风格 chunker 配置生成文档导入审核切片。"""
-        selected_chunker = normalize_document_chunker_type(
-            chunker_type,
-            default=getattr(self.settings, "document_chunker_type", "naive"),
-        )
+        """按文件持久化 chunker 生成审核切片，禁止在构建阶段补默认值。"""
+        if not isinstance(chunker_type, str) or chunker_type not in DOCUMENT_CHUNKER_TYPES:
+            allowed = ", ".join(sorted(DOCUMENT_CHUNKER_TYPES))
+            raise AdminValidationError(f"chunker_type must be one of: {allowed}")
         return build_import_chunks_from_blocks(
             file_id,
             blocks,
             chunk_token_num=getattr(self.settings, "document_chunk_token_num", 512),
-            chunker_type=selected_chunker,
+            chunker_type=chunker_type,
             delimiter=getattr(self.settings, "document_chunk_delimiter", "\n。；！？"),
             overlapped_percent=getattr(self.settings, "document_chunk_overlap_percent", 0),
             children_delimiter=getattr(self.settings, "document_children_delimiter", ""),
             table_context_size=getattr(self.settings, "document_table_context_size", 0),
             image_context_size=getattr(self.settings, "document_image_context_size", 0),
-        )
-
-    def _document_chunker_type_from_record(self, record: dict[str, Any]) -> str:
-        """从文件记录读取 chunker；旧数据缺字段时回退到当前全局配置。"""
-        return normalize_document_chunker_type(
-            record.get("chunker_type"),
-            default=getattr(self.settings, "document_chunker_type", "naive"),
-        )
-
-    def _document_chunker_update_from_payload(
-        self,
-        record: dict[str, Any],
-        payload: dict[str, Any],
-    ) -> str | None:
-        """解析任务 payload 可覆盖文件 chunker；未提供时不写库，避免无意义更新时间。"""
-        if "chunker_type" not in payload:
-            return None
-        return normalize_document_chunker_type(
-            payload.get("chunker_type"),
-            default=self._document_chunker_type_from_record(record),
         )
 
     def _mineru_progress_payload(self, status: Any) -> dict[str, Any]:
@@ -1820,62 +2002,107 @@ class AdminApp:
         progress["state"] = getattr(status, "state", None) or progress.get("state") or "pending"
         return progress
 
-    def _import_parse_status_payload(
+    def _import_parse_input_fingerprint(
         self,
         record: dict[str, Any],
+        stored_path: Path,
         *,
-        state: str | None = None,
-        progress: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """构造文档解析轮询响应，关键约束是 summary 可选但真实页面字段稳定。"""
-        raw_progress = progress if progress is not None else record.get("parse_progress")
-        normalized_progress = _normalize_parse_progress(raw_progress)
-        current_state = state or normalized_progress.get("state") or _state_from_import_status(record.get("status"))
-        normalized_progress.setdefault("state", current_state)
-        # 附带文档级向量摘要，使解析轮询返回的 file 与列表接口同形；前端文件层圆点据此判定「已嵌入(绿)/其余(黄)」。
-        file_record = record
-        file_id = record.get("id")
-        summary_getter = getattr(self.database(), "get_import_file_embedding_summary", None)
-        if file_id and "embedding_summary" not in file_record and summary_getter is not None:
-            file_record = {
-                **record,
-                "embedding_summary": summary_getter(file_id),
-            }
-        return {
-            "file": file_record,
-            "status": record.get("status"),
-            "state": current_state,
-            "progress": normalized_progress,
-            "percent": _parse_progress_percent(normalized_progress),
-            "error": record.get("error"),
+        chunker_type: str,
+    ) -> str:
+        """计算文件内容与解析路线指纹，阻止迟到任务覆盖变化后的来源。"""
+        parser = record["parser"]
+        if not isinstance(parser, str) or not parser:
+            raise AdminValidationError("import parser is required")
+        selected_chunker = normalize_document_chunker_type(chunker_type)
+        parse_contract: dict[str, Any] = {
+            "parser": parser,
+            "chunker_type": selected_chunker,
         }
-
-    def reparse_import_file(self, file_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """按用户选择的解析参数重新切分已上传文件。"""
-        record = self.database().get_import_file(file_id)
-        if record is None:
-            raise AdminNotFoundError(f"Import file not found: {file_id}")
-        if record.get("parser") not in {"markdown_chat", "mineru"}:
-            raise AdminValidationError("only Markdown chat or MinerU files can be reparsed")
-        stored_path = Path(record["stored_path"])
-        if not stored_path.exists():
-            raise AdminValidationError("stored upload file is missing")
-        if record.get("parser") == "mineru":
-            chunker_update = self._document_chunker_update_from_payload(record, payload)
-            if chunker_update is not None:
-                summary = self.database().update_import_file_summary(
-                    file_id,
-                    chunker_type=chunker_update,
-                )
-                record = {**record, **summary}
-            return self._parse_mineru_import(record, stored_path)
-        options = normalize_import_parse_options(payload)
-        return self._parse_markdown_import(
-            record,
-            stored_path.read_bytes(),
-            parse_mode=options["parse_mode"],
-            chunk_days=options["chunk_days"],
+        if parser == "mineru":
+            parse_contract.update(
+                {
+                    "mineru_use_kb_packager": getattr(
+                        self.settings,
+                        "mineru_use_kb_packager",
+                        True,
+                    ),
+                    "document_chunk_token_num": getattr(
+                        self.settings,
+                        "document_chunk_token_num",
+                        512,
+                    ),
+                    "document_chunk_delimiter": getattr(
+                        self.settings,
+                        "document_chunk_delimiter",
+                        "\n。；！？",
+                    ),
+                    "document_chunk_overlap_percent": getattr(
+                        self.settings,
+                        "document_chunk_overlap_percent",
+                        0,
+                    ),
+                    "document_children_delimiter": getattr(
+                        self.settings,
+                        "document_children_delimiter",
+                        "",
+                    ),
+                    "document_table_context_size": getattr(
+                        self.settings,
+                        "document_table_context_size",
+                        0,
+                    ),
+                    "document_image_context_size": getattr(
+                        self.settings,
+                        "document_image_context_size",
+                        0,
+                    ),
+                }
+            )
+        digest = hashlib.sha256()
+        digest.update(b"cyclops-import-parse-v2\0")
+        digest.update(
+            json.dumps(
+                parse_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
         )
+        digest.update(b"\0")
+        with stored_path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return f"sha256:{digest.hexdigest()}"
+
+    def _next_import_parse_poll_at(self) -> datetime:
+        """计算 provider 下一次轮询时间，与 worker 扫描间隔保持同一配置。"""
+        interval = float(
+            getattr(self.settings, "import_parse_worker_poll_interval_seconds", 1.0)
+        )
+        if interval <= 0:
+            raise ValueError("import parse worker poll interval must be positive")
+        return datetime.now(timezone.utc) + timedelta(seconds=interval)
+
+    @staticmethod
+    def _import_parse_job_payload(job: dict[str, Any]) -> dict[str, Any]:
+        """序列化解析任务并移除 lease；缺字段或标量 progress 必须失败。"""
+        progress = job["progress"]
+        if not isinstance(progress, dict):
+            raise TypeError("progress must be a JSON object")
+        return {
+            "id": job["id"],
+            "file_id": job["file_id"],
+            "status": job["status"],
+            "chunker_type": job["chunker_type"],
+            "input_fingerprint": job["input_fingerprint"],
+            "provider_batch_id": job["provider_batch_id"],
+            "provider_file_name": job["provider_file_name"],
+            "progress": dict(progress),
+            "percent": _parse_progress_percent(progress),
+            "error": job["error"],
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+        }
 
     def list_import_chunks(self, file_id: str) -> dict[str, Any]:
         """返回某个导入文件的时间切块列表。"""
@@ -1897,6 +2124,8 @@ class AdminApp:
         record = self.database().get_import_file(file_id)
         if record is None:
             raise AdminNotFoundError(f"Import file not found: {file_id}")
+        if record.get("is_disabled"):
+            raise AdminValidationError("disabled import file cannot be embedded")
         if record.get("status") not in {"needs_review", "completed"}:
             raise AdminValidationError("document must be parsed before embedding")
         chunks = self.database().list_import_chunks(file_id)
@@ -1913,16 +2142,7 @@ class AdminApp:
         embedding_client = self.embedding_client()
         rows = []
         for chunk in pending_chunks:
-            for chunk_row in document_knowledge_rows_for_embedding(chunk, record):
-                vector = embedding_client.embed(chunk_row["embedding_text"])
-                rows.append(
-                    self.database().upsert_knowledge_chunk(
-                        chunk_row,
-                        vector,
-                        embedding_model=embedding_client.model,
-                        embedding_dimensions=embedding_client.dimensions,
-                    )
-                )
+            rows.extend(self._embed_document_chunk_rows(chunk, record, embedding_client))
         return {
             "file_id": file_id,
             "count": len(rows),
@@ -1937,22 +2157,16 @@ class AdminApp:
         chunk = self.database().get_import_chunk(chunk_id)
         if chunk is None:
             raise AdminNotFoundError(f"Import chunk not found: {chunk_id}")
+        if chunk.get("is_disabled"):
+            raise AdminValidationError("disabled import chunk cannot be embedded")
         record = self.database().get_import_file(chunk["file_id"])
         if record is None:
             raise AdminNotFoundError(f"Import file not found: {chunk['file_id']}")
+        if record.get("is_disabled"):
+            raise AdminValidationError("disabled import file cannot be embedded")
 
         embedding_client = self.embedding_client()
-        rows = []
-        for chunk_row in document_knowledge_rows_for_embedding(chunk, record):
-            vector = embedding_client.embed(chunk_row["embedding_text"])
-            rows.append(
-                self.database().upsert_knowledge_chunk(
-                    chunk_row,
-                    vector,
-                    embedding_model=embedding_client.model,
-                    embedding_dimensions=embedding_client.dimensions,
-                )
-            )
+        rows = self._embed_document_chunk_rows(chunk, record, embedding_client)
         return {
             "chunk_id": chunk_id,
             "file_id": chunk["file_id"],
@@ -1961,6 +2175,31 @@ class AdminApp:
             "embedding_summary": self.database().get_import_file_embedding_summary(chunk["file_id"]),
             "messages": [f"已重新生成切片向量 ({len(rows)} 条)"],
         }
+
+    def _embed_document_chunk_rows(
+        self,
+        chunk: dict[str, Any],
+        import_file: dict[str, Any],
+        embedding_client: Any,
+    ) -> list[dict[str, Any]]:
+        """生成一个来源切片的全部向量后原子提交，关键约束是 provider 调用期间不持有数据库锁。"""
+        source_fingerprint = document_embedding_source_fingerprint(import_file, chunk)
+        chunk_rows = document_knowledge_rows_for_embedding(chunk, import_file)
+        items = [
+            (row, embedding_client.embed(row["embedding_text"]))
+            for row in chunk_rows
+        ]
+        try:
+            return self.database().replace_document_chunk_embeddings(
+                file_id=import_file["id"],
+                chunk_id=chunk["id"],
+                source_fingerprint=source_fingerprint,
+                items=items,
+                embedding_model=embedding_client.model,
+                embedding_dimensions=embedding_client.dimensions,
+            )
+        except ValueError as exc:
+            raise AdminValidationError(str(exc)) from exc
 
     def get_import_file_for_download(self, file_id: str) -> tuple[dict[str, Any], Path]:
         """返回可下载的原件路径，关键约束是必须来自已登记导入文件。"""
@@ -2073,6 +2312,14 @@ class AdminApp:
                 )
                 skipped += 1
                 continue
+            existing_questions = list(chunk.get("questions") or [])
+            # pending 只表示生成进度，必须保留现有问题，避免状态切换误伤可用向量。
+            self.database().set_import_chunk_questions(
+                chunk["id"],
+                existing_questions,
+                model=assistant.model,
+                status="pending",
+            )
             try:
                 questions = assistant.generate_questions(
                     source_text=source_text,
@@ -2082,7 +2329,11 @@ class AdminApp:
                 )
             except ImportQuestionError as exc:
                 self.database().set_import_chunk_questions(
-                    chunk["id"], [], model=assistant.model, status="failed", error=str(exc)
+                    chunk["id"],
+                    existing_questions,
+                    model=assistant.model,
+                    status="failed",
+                    error=str(exc),
                 )
                 failed += 1
                 continue
@@ -2227,18 +2478,17 @@ class AdminApp:
         return self.database().update_import_candidate(candidate_id, row)
 
     def save_import_candidate(self, candidate_id: str) -> dict[str, Any]:
-        """将候选 FAQ 保存为标准问答，并立即生成 embedding。"""
+        """将候选保存为待审核 FAQ，关键约束是向量生成保持独立显式步骤。"""
         candidate = self.database().get_import_candidate(candidate_id)
         if candidate is None:
             raise AdminNotFoundError(f"Import candidate not found: {candidate_id}")
         faq_row = build_import_candidate_faq_row(candidate)
         saved = self.database().save_faq_text(faq_row)
-        embedded = self.embed_faq(saved["id"])
         marked = self.database().mark_import_candidate_saved(candidate_id, saved["id"])
         return {
             **marked,
-            "embedding_status": embedded.get("embedding_status"),
-            "embedding_error": embedded.get("embedding_error"),
+            "embedding_status": saved["embedding_status"],
+            "embedding_error": saved["embedding_error"],
         }
 
     def ignore_import_candidate(self, candidate_id: str) -> dict[str, Any]:
@@ -2352,84 +2602,67 @@ class AdminApp:
 
         embedding_started = time.perf_counter()
         retrieval_query = analysis.query_rewrite or question
-        query_embedding = self.embedding_client().embed(retrieval_query)
+        retrieval_result = self.hybrid_retrieval_service().retrieve(
+            retrieval_query,
+            include_parent_context=True,
+            use_kg=False,
+        )
         yield assistant_step_event(
             "query_embedding",
             "向量化",
             "completed",
             embedding_started,
-            summary=f"{len(query_embedding)} 维查询向量",
-            dimensions=len(query_embedding),
+            summary=f"{retrieval_result.query_embedding_dimensions} 维查询向量",
+            dimensions=retrieval_result.query_embedding_dimensions,
             query=retrieval_query,
         )
 
         search_started = time.perf_counter()
-        top_k = getattr(self.settings, "rag_top_k", 5)
-        min_score = getattr(self.settings, "rag_min_score", 0.35)
-        rerank_client = self.rerank_client()
-        rerank_input_size = int(getattr(rerank_client, "input_size", 0) or 0)
-        candidate_limit = max(top_k * 2, top_k, rerank_input_size)
-        query_terms = build_keyword_terms(retrieval_query, self._retrieval_aliases())
-
+        top_k = self.hybrid_retrieval_service().top_k
+        min_score = self.hybrid_retrieval_service().min_score
+        vector_docs = retrieval_result.vector_documents
+        keyword_docs = retrieval_result.keyword_documents
+        candidates = retrieval_result.candidates
         vector_started = time.perf_counter()
-        vector_docs = self.database().search_knowledge(
-            query_embedding,
-            top_k=candidate_limit,
-            min_score=min_score,
-        )
         yield assistant_step_event(
             "vector_search",
             "向量召回",
             "completed",
             vector_started,
             summary=f"向量召回 {len(vector_docs)} 条候选",
-            top_k=candidate_limit,
+            top_k=retrieval_result.candidate_limit,
             min_score=min_score,
             count=len(vector_docs),
         )
 
         keyword_started = time.perf_counter()
-        keyword_docs = self.database().search_knowledge_text(
-            retrieval_query,
-            top_k=candidate_limit,
-            query_terms=query_terms,
-        )
         yield assistant_step_event(
             "keyword_search",
             "关键词召回",
             "completed",
             keyword_started,
             summary=f"关键词召回 {len(keyword_docs)} 条候选",
-            top_k=candidate_limit,
-            query_terms=query_terms,
+            top_k=retrieval_result.candidate_limit,
+            query_terms=retrieval_result.query_terms,
             count=len(keyword_docs),
         )
 
-        fused = fuse_retrieval_candidates(
-            vector_docs=vector_docs,
-            keyword_docs=keyword_docs,
-            top_k=candidate_limit,
-        )
-        rerank_used = False
-        if rerank_client is not None and len(fused) > top_k:
+        if retrieval_result.rerank_used:
             rerank_started = time.perf_counter()
-            fused = rerank_candidates(retrieval_query, fused, client=rerank_client, top_k=top_k)
-            rerank_used = True
             yield assistant_step_event(
                 "rerank",
                 "重排",
                 "completed",
                 rerank_started,
-                summary=f"rerank 输入 {min(len(vector_docs) + len(keyword_docs), rerank_input_size or len(fused))} 候选，截取 top {top_k}",
+                summary=f"rerank 从候选池截取 top {top_k}",
                 top_k=top_k,
-                input_size=rerank_input_size,
-                model=getattr(rerank_client, "model", None),
+                input_size=retrieval_result.candidate_limit,
+                model=getattr(self.hybrid_retrieval_service().rerank, "model", None),
             )
-        else:
-            fused = fused[:top_k]
-        docs = [candidate.document for candidate in fused]
-        documents = []
-        for candidate in fused:
+
+        docs = [candidate.document for candidate in candidates]
+        ranked_documents = []
+        for candidate in candidates:
             payload_doc = assistant_document_payload(candidate.document)
             payload_doc.update(
                 {
@@ -2439,11 +2672,11 @@ class AdminApp:
                     "keyword_score": candidate.keyword_score,
                 }
             )
-            documents.append(payload_doc)
-        parent_docs = parent_context_documents(self.database(), docs)
-        if parent_docs:
-            docs.extend(parent_docs)
-            for parent_doc in parent_docs:
+            ranked_documents.append(payload_doc)
+        context_documents = list(ranked_documents)
+        if retrieval_result.parent_documents:
+            docs.extend(retrieval_result.parent_documents)
+            for parent_doc in retrieval_result.parent_documents:
                 payload_doc = assistant_document_payload(parent_doc)
                 payload_doc.update(
                     {
@@ -2453,31 +2686,31 @@ class AdminApp:
                         "keyword_score": None,
                     }
                 )
-                documents.append(payload_doc)
+                context_documents.append(payload_doc)
         yield assistant_step_event(
             "hybrid_retrieval",
             "混合召回",
             "completed",
             search_started,
-            summary=f"向量 {len(vector_docs)} 条，关键词 {len(keyword_docs)} 条，融合后 {len(documents)} 条",
+            summary=f"向量 {len(vector_docs)} 条，关键词 {len(keyword_docs)} 条，融合后 {len(ranked_documents)} 条",
             top_k=top_k,
             min_score=min_score,
-            candidate_limit=candidate_limit,
+            candidate_limit=retrieval_result.candidate_limit,
             vector_count=len(vector_docs),
             keyword_count=len(keyword_docs),
-            query_terms=query_terms,
-            documents=documents,
+            query_terms=retrieval_result.query_terms,
+            documents=ranked_documents,
         )
 
         context_started = time.perf_counter()
-        top_score = documents[0]["score"] if documents else None
+        top_score = ranked_documents[0]["score"] if ranked_documents else None
         yield assistant_step_event(
             "source_context",
             "命中来源",
             "completed",
             context_started,
             summary=f"最高分 {top_score:.2f}" if top_score is not None else "未检索到可用来源",
-            documents=documents,
+            documents=context_documents,
         )
 
         answer_started = time.perf_counter()
@@ -2526,31 +2759,28 @@ class AdminApp:
             "flow_id": "basic_rag",
             "question": question,
             "answer_draft": answer_draft,
-            "documents": documents,
+            "documents": context_documents,
         }
         self._record_assistant_chat_event(
             question=question,
             analysis=analysis,
-            documents=documents,
+            documents=ranked_documents,
             payload=payload,
             started=started,
-            rerank_used=rerank_used,
+            rerank_used=retrieval_result.rerank_used,
         )
 
     def _record_assistant_chat_event(
         self,
         *,
         question: str,
-        analysis: Any,
+        analysis: QueryAnalysis,
         documents: list[dict[str, Any]],
         payload: dict[str, Any],
         started: float,
         rerank_used: bool,
     ) -> None:
         """把 RAG 主路径的一次查询写入 query_analytics_events，失败不影响主流程。"""
-        record = getattr(self.database(), "record_query_event", None)
-        if record is None:
-            return
         hit_count = len(documents)
         top_score = documents[0].get("score") if documents else None
         chunk_ids = [str(doc.get("id") or "") for doc in documents if doc.get("id")]
@@ -2558,10 +2788,9 @@ class AdminApp:
         requester_id_raw = payload.get("requester_id")
         requester_id = str(requester_id_raw).strip() if requester_id_raw else None
         latency_ms = int((time.perf_counter() - started) * 1000)
-        intent = getattr(analysis, "intent", None)
         event = {
             "query": question,
-            "intent": intent,
+            "intent": analysis.intent,
             "retrieved_chunk_ids": chunk_ids,
             "top_score": top_score,
             "hit_count": hit_count,
@@ -2572,7 +2801,7 @@ class AdminApp:
             "metadata": {"flow": "basic_rag"},
         }
         try:
-            record(event)
+            self.database().record_query_event(event)
         except Exception as exc:
             logger.warning("query analytics record failed: %s", exc, exc_info=True)
 
@@ -2600,363 +2829,3 @@ def static_path(path: str) -> Path:
             return candidate
         raise AdminNotFoundError(path)
     raise AdminNotFoundError(path)
-
-
-def make_handler(app: AdminApp):
-    class AdminHandler(BaseHTTPRequestHandler):
-        server_version = "CyclopsAdmin/0.1"
-
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            try:
-                if parsed.path == "/favicon.ico":
-                    self.send_response(HTTPStatus.NO_CONTENT)
-                    self.end_headers()
-                    return
-                if parsed.path == "/api/settings":
-                    self.send_json(app.settings_snapshot())
-                    return
-                if parsed.path == "/api/retrieval/eval-cases":
-                    self.send_json(app.list_retrieval_eval_cases(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/retrieval/aliases":
-                    self.send_json(app.list_retrieval_aliases())
-                    return
-                if parsed.path == "/api/kg/entities":
-                    self.send_json(app.list_kg_entities(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/kg/relations":
-                    self.send_json(app.list_kg_relations(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/kg/subgraph":
-                    self.send_json(app.kg_subgraph(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/import/files":
-                    self.send_json(app.list_import_files(parse_qs(parsed.query)))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/download"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/download")
-                    record, stored_path = app.get_import_file_for_download(file_id)
-                    self.send_download(stored_path, record.get("original_name") or stored_path.name)
-                    return
-                if parsed.path.startswith("/api/import/files/") and "/assets/" in parsed.path:
-                    # 资产路由：/api/import/files/<file_id>/assets/<relpath>
-                    head, _, asset_relpath = parsed.path.removeprefix("/api/import/files/").partition("/assets/")
-                    file_id = head
-                    _record, asset_path = app.get_import_asset(file_id, unquote(asset_relpath))
-                    self.send_static(asset_path)
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/chunks"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/chunks")
-                    self.send_json(app.list_import_chunks(file_id))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/parse-status"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/parse-status")
-                    self.send_json(app.get_import_parse_status(file_id))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/candidates"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/candidates")
-                    self.send_json(app.list_import_file_candidates(file_id))
-                    return
-                if parsed.path.startswith("/api/import/chunks/") and parsed.path.endswith("/candidates"):
-                    chunk_id = parsed.path.removeprefix("/api/import/chunks/").removesuffix("/candidates")
-                    self.send_json(app.list_import_candidates(chunk_id))
-                    return
-                if parsed.path.startswith("/api/import/generation-jobs/") and parsed.path.endswith("/events"):
-                    job_id = parsed.path.removeprefix("/api/import/generation-jobs/").removesuffix("/events")
-                    self.send_sse(app.iter_import_generation_events(job_id))
-                    return
-                if parsed.path.startswith("/api/faqs/"):
-                    faq_id = parsed.path.removeprefix("/api/faqs/")
-                    self.send_json(app.get_faq(faq_id))
-                    return
-                if parsed.path == "/api/faqs":
-                    self.send_json(app.list_faqs(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/overview":
-                    self.send_json(app.analytics_overview())
-                    return
-                if parsed.path == "/api/analytics/top-queries":
-                    self.send_json(app.list_top_queries(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/zero-hit":
-                    self.send_json(app.list_zero_hit_queries(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/low-score":
-                    self.send_json(app.list_low_score_queries(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/top-chunks":
-                    self.send_json(app.list_top_referenced_chunks(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/hit-rate":
-                    self.send_json(app.query_hit_rate_timeseries(parse_qs(parsed.query)))
-                    return
-                if parsed.path == "/api/analytics/cluster-summaries":
-                    self.send_json(app.list_cluster_summaries(parse_qs(parsed.query)))
-                    return
-                self.send_static(static_path(parsed.path))
-            except Exception as exc:
-                self.send_error_json(exc)
-
-        def do_POST(self) -> None:
-            parsed = urlparse(self.path)
-            try:
-                if parsed.path == "/api/import/files":
-                    filename, content = self.read_multipart_file()
-                    auto_parse = parse_qs(parsed.query).get("parse", ["true"])[0].lower() != "false"
-                    self.send_json(app.create_import_file(filename, content, auto_parse=auto_parse))
-                    return
-                payload = self.read_json()
-                if parsed.path == "/api/settings":
-                    self.send_json(app.update_settings(payload))
-                    return
-                if parsed.path == "/api/retrieval/eval-cases":
-                    self.send_json(app.create_retrieval_eval_case(payload))
-                    return
-                if parsed.path.startswith("/api/retrieval/eval-cases/") and parsed.path.endswith("/run"):
-                    case_id = parsed.path.removeprefix("/api/retrieval/eval-cases/").removesuffix("/run")
-                    self.send_json(app.run_retrieval_eval_case(case_id, payload))
-                    return
-                if parsed.path == "/api/retrieval/aliases":
-                    self.send_json(app.save_retrieval_alias(payload))
-                    return
-                if parsed.path == "/api/kg/extraction-jobs":
-                    self.send_json(app.create_kg_extraction_job(payload))
-                    return
-                if parsed.path.startswith("/api/kg/entities/") and parsed.path.endswith("/confirm"):
-                    entity_id = parsed.path.removeprefix("/api/kg/entities/").removesuffix("/confirm")
-                    self.send_json(app.confirm_kg_entity(entity_id))
-                    return
-                if parsed.path.startswith("/api/kg/entities/") and parsed.path.endswith("/status"):
-                    entity_id = parsed.path.removeprefix("/api/kg/entities/").removesuffix("/status")
-                    self.send_json(app.set_kg_entity_status(entity_id, payload))
-                    return
-                if parsed.path.startswith("/api/kg/relations/") and parsed.path.endswith("/confirm"):
-                    relation_id = parsed.path.removeprefix("/api/kg/relations/").removesuffix("/confirm")
-                    self.send_json(app.confirm_kg_relation(relation_id))
-                    return
-                if parsed.path.startswith("/api/kg/relations/") and parsed.path.endswith("/status"):
-                    relation_id = parsed.path.removeprefix("/api/kg/relations/").removesuffix("/status")
-                    self.send_json(app.set_kg_relation_status(relation_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/reparse"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/reparse")
-                    self.send_json(app.reparse_import_file(file_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/parse-jobs"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/parse-jobs")
-                    self.send_json(app.start_import_parse_job(file_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/disabled"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/disabled")
-                    self.send_json(app.set_import_file_disabled(file_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/generate-questions"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/generate-questions")
-                    self.send_json(app.generate_import_file_questions(file_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/files/") and parsed.path.endswith("/embed"):
-                    file_id = parsed.path.removeprefix("/api/import/files/").removesuffix("/embed")
-                    self.send_json(app.embed_import_file(file_id))
-                    return
-                if parsed.path == "/api/faqs":
-                    self.send_json(app.save_faq(payload))
-                    return
-                if parsed.path == "/api/faqs/batch-status":
-                    # 批量状态接口只处理用户显式勾选的 FAQ。
-                    self.send_json(app.batch_update_status(payload))
-                    return
-                if parsed.path == "/api/faqs/embed-pending":
-                    self.send_json(app.embed_pending(payload))
-                    return
-                if parsed.path == "/api/ai/optimize":
-                    self.send_json(app.optimize(payload))
-                    return
-                if parsed.path == "/api/assistant/chat-stream":
-                    requester_type = self.headers.get("X-Requester-Type")
-                    requester_id = self.headers.get("X-Requester-Id")
-                    if requester_type and not payload.get("requester_type"):
-                        payload["requester_type"] = requester_type
-                    if requester_id and not payload.get("requester_id"):
-                        payload["requester_id"] = requester_id
-                    self.send_sse(app.iter_assistant_chat_events(payload))
-                    return
-                if parsed.path == "/api/assistant/probe":
-                    self.send_json(app.probe_chat_provider(payload))
-                    return
-                if parsed.path == "/api/assistant/models":
-                    self.send_json(app.list_chat_provider_models(payload))
-                    return
-                if parsed.path == "/api/analytics/cluster-zero-hit":
-                    self.send_json(app.cluster_zero_hit_queries(payload))
-                    return
-                if parsed.path == "/api/import/generation-jobs":
-                    self.send_json(app.create_import_generation_job(payload))
-                    return
-                if parsed.path.startswith("/api/import/chunks/") and parsed.path.endswith("/generate"):
-                    chunk_id = parsed.path.removeprefix("/api/import/chunks/").removesuffix("/generate")
-                    self.send_json(app.generate_import_candidates(chunk_id))
-                    return
-                if parsed.path.startswith("/api/import/chunks/") and parsed.path.endswith("/disabled"):
-                    chunk_id = parsed.path.removeprefix("/api/import/chunks/").removesuffix("/disabled")
-                    self.send_json(app.set_import_chunk_disabled(chunk_id, payload))
-                    return
-                if parsed.path.startswith("/api/import/chunks/") and parsed.path.endswith("/embed"):
-                    chunk_id = parsed.path.removeprefix("/api/import/chunks/").removesuffix("/embed")
-                    self.send_json(app.embed_import_chunk(chunk_id))
-                    return
-                if parsed.path.startswith("/api/import/chunks/"):
-                    chunk_id = parsed.path.removeprefix("/api/import/chunks/")
-                    if "/" not in chunk_id:
-                        self.send_json(app.update_import_chunk_text(chunk_id, payload))
-                        return
-                if parsed.path.startswith("/api/import/candidates/") and parsed.path.endswith("/save"):
-                    candidate_id = parsed.path.removeprefix("/api/import/candidates/").removesuffix("/save")
-                    self.send_json(app.save_import_candidate(candidate_id))
-                    return
-                if parsed.path.startswith("/api/import/candidates/") and parsed.path.endswith("/ignore"):
-                    candidate_id = parsed.path.removeprefix("/api/import/candidates/").removesuffix("/ignore")
-                    self.send_json(app.ignore_import_candidate(candidate_id))
-                    return
-                if parsed.path.startswith("/api/import/candidates/"):
-                    candidate_id = parsed.path.removeprefix("/api/import/candidates/")
-                    self.send_json(app.update_import_candidate(candidate_id, payload))
-                    return
-                if parsed.path.startswith("/api/faqs/") and parsed.path.endswith("/embed"):
-                    faq_id = parsed.path.removeprefix("/api/faqs/").removesuffix("/embed")
-                    self.send_json(app.embed_faq(faq_id))
-                    return
-                raise AdminNotFoundError(parsed.path)
-            except Exception as exc:
-                self.send_error_json(exc)
-
-        def do_DELETE(self) -> None:
-            parsed = urlparse(self.path)
-            try:
-                if parsed.path.startswith("/api/import/files/"):
-                    file_id = parsed.path.removeprefix("/api/import/files/")
-                    self.send_json(app.delete_import_file(file_id))
-                    return
-                raise AdminNotFoundError(parsed.path)
-            except Exception as exc:
-                self.send_error_json(exc)
-
-        def read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length == 0:
-                return {}
-            ensure_request_size(length, app.settings.admin_max_json_bytes, "json")
-            raw = self.rfile.read(length).decode("utf-8")
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise AdminValidationError("request body must be valid JSON") from exc
-            if not isinstance(payload, dict):
-                raise AdminValidationError("request body must be a JSON object")
-            return payload
-
-        def read_multipart_file(self) -> tuple[str, bytes]:
-            """读取单文件上传表单，当前只接受字段名 file。
-
-            关键约束：在读 body 之前先按 admin_max_request_bytes 守门，避免恶意
-            Content-Length 把 GB 级请求体灌进内存。
-            """
-            content_type = self.headers.get("Content-Type", "")
-            boundary_match = re.search(r"boundary=(.+)", content_type)
-            if not boundary_match:
-                raise AdminValidationError("multipart boundary is required")
-            boundary = boundary_match.group(1).strip('"').encode("utf-8")
-            length = int(self.headers.get("Content-Length", "0"))
-            ensure_request_size(length, app.settings.admin_max_request_bytes, "upload")
-            body = self.rfile.read(length)
-            for part in body.split(b"--" + boundary):
-                if b'name="file"' not in part:
-                    continue
-                header, _, content = part.partition(b"\r\n\r\n")
-                filename_match = re.search(
-                    rb'filename="([^"]+)"',
-                    header,
-                )
-                if not filename_match:
-                    raise AdminValidationError("uploaded file name is required")
-                filename = filename_match.group(1).decode("utf-8", errors="replace")
-                return filename, content.rstrip(b"\r\n-")
-            raise AdminValidationError("multipart field file is required")
-
-        def send_static(self, path: Path) -> None:
-            if not path.exists():
-                raise AdminNotFoundError(str(path))
-            content = path.read_bytes()
-            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
-
-        def send_download(self, path: Path, filename: str) -> None:
-            """发送已上传原件，文件名通过 RFC 5987 编码避免中文乱码。"""
-            if not path.exists():
-                raise AdminNotFoundError(str(path))
-            content = path.read_bytes()
-            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
-            self.end_headers()
-            self.wfile.write(content)
-
-        def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-            content = json.dumps(jsonable(payload), ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
-
-        def send_sse(self, events: Any) -> None:
-            """发送生成任务进度事件流，供前端 EventSource 消费。"""
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            try:
-                for event in events:
-                    self.wfile.write(format_sse_event(event).encode("utf-8"))
-                    self.wfile.flush()
-            except Exception as exc:
-                _, sanitized_body = classify_error_response(exc)
-                if sanitized_body["error"] == "internal error":
-                    logger.warning("sse stream failed: %s", exc, exc_info=True)
-                error_event = {"type": "error", "error": sanitized_body["error"]}
-                self.wfile.write(format_sse_event(error_event).encode("utf-8"))
-                self.wfile.flush()
-
-        def send_error_json(self, exc: Exception) -> None:
-            """统一响应错误；500 类异常写完整堆栈到日志，前端只看到固定文案。"""
-            status, body = classify_error_response(exc)
-            if status == HTTPStatus.INTERNAL_SERVER_ERROR:
-                logger.error(
-                    "admin handler internal error: %s\n%s", exc, traceback.format_exc()
-                )
-            self.send_json(body, status=status)
-
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-    return AdminHandler
-
-
-def run_admin_server(settings: Settings, *, host: str, port: int) -> None:
-    """启动本地后台 HTTP 服务；非 loopback host 必须显式 env 同意，避免误暴露。
-
-    用 ThreadingHTTPServer 而不是单线程 HTTPServer：embed 这类阻塞调用（同步循环请求 OpenAI embedding API）
-    可能持续几十秒到几分钟，单线程会让期间所有其他请求（含轮询解析进度、刷新列表）全部排队卡死。
-    """
-    ensure_loopback_or_explicit_opt_in(host, os.environ)
-    app = AdminApp(settings)
-    app.database().init_schema()
-    server = ThreadingHTTPServer((host, port), make_handler(app))
-    print(f"Cyclops admin: http://{host}:{port}", flush=True)
-    server.serve_forever()

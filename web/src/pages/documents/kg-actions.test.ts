@@ -19,8 +19,8 @@ test('shortens long document ids but keeps short ids intact', () => {
 })
 
 test('formats chunk page locator compactly without block type noise', () => {
-  assert.equal(formatChunkPageLocator({ page_start: 14, page_end: 15, block_type: 'text' }), 'p14-15')
-  assert.equal(formatChunkPageLocator({ page_start: 14, page_end: 14, block_type: 'title' }), 'p14')
-  assert.equal(formatChunkPageLocator({ page_start: 0, page_end: 0, block_type: 'cover' }), 'p0')
-  assert.equal(formatChunkPageLocator({ page_start: null, page_end: null, block_type: 'text' }), '')
+  assert.equal(formatChunkPageLocator({ page_start: 14, page_end: 15 }), 'p14-15')
+  assert.equal(formatChunkPageLocator({ page_start: 14, page_end: 14 }), 'p14')
+  assert.equal(formatChunkPageLocator({ page_start: 0, page_end: 0 }), 'p0')
+  assert.equal(formatChunkPageLocator({ page_start: null, page_end: null }), '')
 })

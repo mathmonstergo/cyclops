@@ -1,16 +1,71 @@
 import json
 from types import SimpleNamespace
 
-from cyclops.cli import build_parser, main
+import pytest
+
+from cyclops.cli import build_parser, build_rag_tool, main
+
+
+def test_search_command_uses_hybrid_retrieval_and_keeps_kg_disabled(monkeypatch, capsys):
+    """CLI search 必须使用统一服务，且只打印 direct 候选的 canonical 标题。"""
+    settings = SimpleNamespace(database_url="postgresql://unused")
+    document = SimpleNamespace(
+        id="kc_document_child_1",
+        score=0.82,
+        source_title="平台操作手册",
+        source_id="file_1",
+    )
+
+    class FakeRetrieval:
+        """记录 CLI search 的显式 KG 与 parent 参数。"""
+
+        def retrieve(self, question, *, include_parent_context, use_kg):
+            """校验 CLI 检索参数并返回固定候选。"""
+            assert question == "报告怎么导出？"
+            assert include_parent_context is False
+            assert use_kg is False
+            return SimpleNamespace(
+                candidates=[SimpleNamespace(document=document)],
+                parent_documents=[],
+            )
+
+    monkeypatch.setattr("cyclops.cli.Settings.load", lambda: settings)
+    monkeypatch.setattr(
+        "cyclops.cli.build_hybrid_retrieval",
+        lambda actual: FakeRetrieval(),
+    )
+
+    assert main(["search", "报告怎么导出？"]) == 0
+    assert capsys.readouterr().out.strip() == "0.82 kc_document_child_1 平台操作手册"
+
+
+def test_build_rag_tool_reuses_caller_database_for_hybrid_retrieval(monkeypatch):
+    """MCP 等入口装配 RagTool 时必须能与 analytics 共用同一 Database。"""
+    settings = SimpleNamespace()
+    database = object()
+    retrieval = SimpleNamespace(top_k=5, min_score=0.35)
+    calls = []
+
+    monkeypatch.setattr(
+        "cyclops.cli.build_hybrid_retrieval",
+        lambda actual, *, database: calls.append((actual, database)) or retrieval,
+    )
+    monkeypatch.setattr("cyclops.cli.ChatClient.from_settings", lambda actual: object())
+    monkeypatch.setattr("cyclops.cli.load_system_prompt", lambda: "系统提示")
+
+    tool = build_rag_tool(settings, database=database)
+
+    assert tool.retrieval is retrieval
+    assert calls == [(settings, database)]
 
 
 def test_parser_accepts_core_commands():
+    """核心 CLI 命令必须均可被解析器识别。"""
     parser = build_parser()
     assert parser.prog == "cyclops"
     for command in [
         "check-config",
         "init-db",
-        "sync-knowledge-chunks",
         "import-faq",
         "search",
         "ask",
@@ -24,25 +79,10 @@ def test_parser_accepts_core_commands():
         assert args.command == command
 
 
-def test_sync_knowledge_chunks_projects_ready_faqs(monkeypatch, capsys):
-    """同步命令应复用数据库已有 FAQ 向量投影到统一知识单元表。"""
-    settings = SimpleNamespace(database_url="postgresql://unused")
-    calls = []
-
-    class FakeDatabase:
-        def __init__(self, database_url):
-            calls.append(("init", database_url))
-
-        def sync_ready_faq_knowledge_chunks(self):
-            calls.append(("sync",))
-            return 3
-
-    monkeypatch.setattr("cyclops.cli.Settings.load", lambda: settings)
-    monkeypatch.setattr("cyclops.cli.Database", FakeDatabase)
-
-    assert main(["sync-knowledge-chunks"]) == 0
-    assert calls == [("init", "postgresql://unused"), ("sync",)]
-    assert capsys.readouterr().out.strip() == "synced 3 ready faq knowledge chunks"
+def test_parser_rejects_removed_sync_knowledge_chunks_command():
+    """FAQ 已随写入原子投影，CLI 不得继续暴露旧同步补偿命令。"""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["sync-knowledge-chunks"])
 
 
 def test_wechat_login_dispatches_to_service(monkeypatch):

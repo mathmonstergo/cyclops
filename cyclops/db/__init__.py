@@ -1,11 +1,4 @@
-"""cyclops.db 包：按业务域拆分的数据库层。
-
-对外暴露与旧 db.py 完全相同的 public 接口：
-- Database 类（通过多个业务 mixin 继承 BaseDatabase 组合而成）
-- RetrievedDocument / RetrievedKnowledgeChunk dataclass
-- format_vector / score_to_distance
-- build_* / compute_* / next_embedding_status / empty_import_file_embedding_summary
-"""
+"""cyclops.db 包：组合数据库业务 mixin，并导出 canonical 数据模型与构建器。"""
 
 from __future__ import annotations
 
@@ -18,20 +11,28 @@ from cyclops.db.builders import (
     build_import_candidate_faq_row,
     compute_content_hash,
     compute_knowledge_chunk_hash,
+    document_embedding_source_fingerprint,
     empty_import_file_embedding_summary,
     next_embedding_status,
 )
 from cyclops.db.faq import FaqMixin
 from cyclops.db.imports import ImportMixin
-from cyclops.db.kg import KnowledgeGraphMixin
+from cyclops.db.kg import KgReviewConflictError, KnowledgeGraphMixin
 from cyclops.db.knowledge import KnowledgeMixin
 from cyclops.db.models import (
-    RetrievedDocument,
+    KgExpandedCandidate,
+    KgFactHit,
     RetrievedKnowledgeChunk,
     format_vector,
     score_to_distance,
 )
-from cyclops.db.retrieval_meta import RetrievalMetaMixin
+from cyclops.db.retrieval_meta import (
+    RETRIEVAL_EVAL_BASELINE_STRATEGY,
+    RETRIEVAL_EVAL_CONTRACT_VERSION,
+    RETRIEVAL_EVAL_KG_DEBUG_STRATEGY,
+    RETRIEVAL_EVAL_STRATEGIES,
+    RetrievalMetaMixin,
+)
 
 
 class Database(
@@ -50,8 +51,14 @@ class Database(
 
 __all__ = [
     "Database",
-    "RetrievedDocument",
+    "KgExpandedCandidate",
+    "KgFactHit",
+    "KgReviewConflictError",
     "RetrievedKnowledgeChunk",
+    "RETRIEVAL_EVAL_BASELINE_STRATEGY",
+    "RETRIEVAL_EVAL_CONTRACT_VERSION",
+    "RETRIEVAL_EVAL_KG_DEBUG_STRATEGY",
+    "RETRIEVAL_EVAL_STRATEGIES",
     "format_vector",
     "score_to_distance",
     "build_embedding_text",
@@ -60,6 +67,7 @@ __all__ = [
     "build_import_candidate_faq_row",
     "compute_content_hash",
     "compute_knowledge_chunk_hash",
+    "document_embedding_source_fingerprint",
     "next_embedding_status",
     "empty_import_file_embedding_summary",
 ]

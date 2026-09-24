@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
+  Bot,
   Loader2,
   Save,
   Wand2,
@@ -26,6 +27,7 @@ import { TagInput } from '@/components/shared/tag-input'
 import { toast } from '@/components/ui/toast'
 import {
   useEmbedFaq,
+  useCreateKgExtractionJob,
   useFaq,
   useOptimizeFaq,
   useSaveFaq,
@@ -34,6 +36,8 @@ import { useUi } from '@/store/ui'
 import { cn } from '@/lib/cn'
 import { confidenceLabel, embeddingStatusLabel, faqStatusLabel, tr } from '@/lib/labels'
 import type { Faq } from '@/api/schemas'
+import { formatKgExtractionResult } from '../documents/kg-actions'
+import { canExtractFaqKg } from './kg-actions'
 
 interface Props {
   faqId: string | null
@@ -123,6 +127,7 @@ function FaqEditor({
 }) {
   const save = useSaveFaq()
   const embed = useEmbedFaq()
+  const createKgJob = useCreateKgExtractionJob()
   const optimize = useOptimizeFaq()
   const { setFaqDirty } = useUi()
 
@@ -130,6 +135,7 @@ function FaqEditor({
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(baseline), [draft, baseline])
   const needsEmbed = !isNew && faq?.embedding_status !== 'ready'
+  const canExtractKg = canExtractFaqKg({ isNew, dirty, status: faq?.status })
 
   useEffect(() => {
     setFaqDirty(dirty)
@@ -193,6 +199,20 @@ function FaqEditor({
         tags: r.tags?.length ? r.tags : d.tags,
       }))
       toast.success('已应用 AI 优化建议')
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
+  // 从已保存 usable FAQ 发起显式异步 KG 任务；终态失败由 hook 原样抛出。
+  const onExtractKg = async () => {
+    if (!canExtractKg) {
+      toast.error('请先保存修改，并确保 FAQ 状态为可用')
+      return
+    }
+    try {
+      const job = await createKgJob.mutateAsync({ source_type: 'faq', source_id: faqId })
+      toast.success(formatKgExtractionResult(job))
     } catch (e) {
       toast.error((e as Error).message)
     }
@@ -329,6 +349,25 @@ function FaqEditor({
           aria-label="关闭"
         >
           <X className="size-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="cursor-pointer"
+          onClick={onExtractKg}
+          disabled={!canExtractKg || createKgJob.isPending}
+          title={
+            canExtractKg
+              ? '从当前 FAQ 抽取 KG 候选'
+              : '仅已保存、无未保存修改且状态可用的 FAQ 可抽取'
+          }
+        >
+          {createKgJob.isPending ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Bot className="size-3.5" />
+          )}
+          KG 抽取
         </Button>
         <Button
           variant={needsEmbed ? 'primary' : 'ghost'}

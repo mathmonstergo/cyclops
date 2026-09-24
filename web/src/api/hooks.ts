@@ -1,12 +1,15 @@
 import {
+  type QueryClient,
   useIsMutating,
   useMutation,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
 import { requestJson } from './client'
+import { waitForKgExtractionJob } from './kg-jobs'
 import type {
   AssistantSettingsSnapshot,
+  DocumentChunkerType,
   Faq,
   FaqListResponse,
   ImportChunkListResponse,
@@ -22,9 +25,10 @@ import type {
   ProviderProbeResponse,
   RetrievalAlias,
   RetrievalAliasListResponse,
-  RetrievalEvalCase,
+  RetrievalEvalCaseRecord,
   RetrievalEvalCaseListResponse,
   RetrievalEvalRun,
+  RetrievalEvalRunPayload,
   SettingsSnapshot,
 } from './schemas'
 
@@ -57,6 +61,7 @@ export function useImportFiles(
   })
 }
 
+// 读取解析进度；成功终态在实际响应边界刷新 KG，不能依赖可能已卸载的页面 effect。
 export function useImportFileParseStatus(
   fileId: string | null,
   options?: {
@@ -66,12 +71,22 @@ export function useImportFileParseStatus(
       | ((q: { state: { data?: ParseStatusResponse } }) => number | false | undefined)
   },
 ) {
+  const qc = useQueryClient()
   return useQuery({
     queryKey: ['import-parse-status', fileId],
-    queryFn: () =>
-      requestJson<ParseStatusResponse>(
-        `/api/import/files/${encodeURIComponent(fileId!)}/parse-status`,
-      ),
+    queryFn: async () => {
+      if (!fileId) throw new Error('fileId is required for import parse status')
+      const response = await requestJson<ParseStatusResponse>(
+        `/api/import/files/${encodeURIComponent(fileId)}/parse-status`,
+      )
+      if (
+        response.file.status === 'needs_review' ||
+        response.file.status === 'completed'
+      ) {
+        await invalidateKgReviewQueries(qc)
+      }
+      return response
+    },
     enabled: !!fileId,
     refetchInterval: options?.refetchInterval as never,
     staleTime: 0,
@@ -93,21 +108,25 @@ export interface ParseStatusResponse {
   error: string | null
 }
 
+// 读取指定文档切片；禁用查询不能靠 non-null assertion 伪造 ID。
 export function useImportFileChunks(
   fileId: string | null,
   options?: { refetchInterval?: number },
 ) {
   return useQuery({
     queryKey: ['import-chunks', fileId],
-    queryFn: () =>
-      requestJson<ImportChunkListResponse>(
-        `/api/import/files/${encodeURIComponent(fileId!)}/chunks`,
-      ),
+    queryFn: () => {
+      if (!fileId) throw new Error('fileId is required for import chunks')
+      return requestJson<ImportChunkListResponse>(
+        `/api/import/files/${encodeURIComponent(fileId)}/chunks`,
+      )
+    },
     enabled: !!fileId,
     refetchInterval: options?.refetchInterval,
   })
 }
 
+// 删除文档会失效其 KG evidence；成功后同时刷新文档列表与统一 KG 审核读模型。
 export function useDeleteImportFile() {
   const qc = useQueryClient()
   return useMutation({
@@ -115,7 +134,10 @@ export function useDeleteImportFile() {
       requestJson<MessagesResponse>(`/api/import/files/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['import-files'] }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ['import-files'] })
+      await invalidateKgReviewQueries(qc)
+    },
   })
 }
 
@@ -151,23 +173,32 @@ export function useGenerateImportFileQuestions() {
   })
 }
 
+// 启动解析任务；只有同步返回成功终态时已替换 snapshot，processing 阶段不能提前刷新 KG。
 export function useStartImportParseJob() {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['start-parse-job'],
-    mutationFn: ({ id, chunker_type, parser }: { id: string; chunker_type?: string; parser?: string }) =>
-      requestJson<MessagesResponse>(
+    // 启动解析返回完整轮询快照；chunker 只接受当前四个 canonical 枚举值。
+    mutationFn: ({ id, chunker_type, parser }: { id: string; chunker_type?: DocumentChunkerType; parser?: string }) =>
+      requestJson<ParseStatusResponse>(
         `/api/import/files/${encodeURIComponent(id)}/parse-jobs`,
         { method: 'POST', body: { ...(parser ? { parser } : {}), ...(chunker_type ? { chunker_type } : {}) } },
       ),
-    onSuccess: (_data, vars) => {
+    onSuccess: async (data, vars) => {
       qc.invalidateQueries({ queryKey: ['import-files'] })
       qc.invalidateQueries({ queryKey: ['import-parse-status', vars.id] })
       qc.invalidateQueries({ queryKey: ['import-chunks', vars.id] })
+      if (
+        data.file.status === 'needs_review' ||
+        data.file.status === 'completed'
+      ) {
+        await invalidateKgReviewQueries(qc)
+      }
     },
   })
 }
 
+// 启停文档会改变其全部 KG evidence 的实时有效性；仅服务端成功后刷新 KG。
 export function useToggleImportFileDisabled() {
   const qc = useQueryClient()
   return useMutation({
@@ -191,10 +222,14 @@ export function useToggleImportFileDisabled() {
     onError: (_err, _vars, ctx) => {
       ctx?.snapshots.forEach(([key, data]) => qc.setQueryData(key, data))
     },
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
+    },
     onSettled: () => qc.invalidateQueries({ queryKey: ['import-files'] }),
   })
 }
 
+// 启停切片会改变该切片关联 evidence 的实时有效性；失败回滚时不得刷新 KG。
 export function useToggleImportChunkDisabled() {
   const qc = useQueryClient()
   return useMutation({
@@ -219,10 +254,14 @@ export function useToggleImportChunkDisabled() {
     onError: (_err, _vars, ctx) => {
       ctx?.snapshots.forEach(([key, data]) => qc.setQueryData(key, data))
     },
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
+    },
     onSettled: () => qc.invalidateQueries({ queryKey: ['import-chunks'] }),
   })
 }
 
+// 修改切片正文会让旧 evidence 失效；成功后刷新切片与全部 KG 审核查询。
 export function useUpdateImportChunk() {
   const qc = useQueryClient()
   return useMutation({
@@ -231,7 +270,10 @@ export function useUpdateImportChunk() {
         method: 'POST',
         body: { source_text },
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['import-chunks'] }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ['import-chunks'] })
+      await invalidateKgReviewQueries(qc)
+    },
   })
 }
 
@@ -321,27 +363,33 @@ export function useFaqs(params: FaqListParams = {}) {
           page,
           page_size: pageSize,
         },
-      }),
+    }),
     staleTime: 10_000,
     placeholderData: (prev) => prev,
   })
 }
 
+// 读取单条 FAQ；queryFn 只允许在真实 ID 存在时发起请求。
 export function useFaq(id: string | null) {
   return useQuery({
     queryKey: ['faq', id],
-    queryFn: () => requestJson<Faq>(`/api/faqs/${encodeURIComponent(id!)}`),
+    queryFn: () => {
+      if (!id) throw new Error('FAQ id is required')
+      return requestJson<Faq>(`/api/faqs/${encodeURIComponent(id)}`)
+    },
     enabled: !!id,
   })
 }
 
+// 保存 FAQ 正文或状态会改变 KG evidence 实时有效性；成功后统一刷新 FAQ 与 KG。
 export function useSaveFaq() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (payload: Partial<Faq>) =>
       requestJson<Faq>('/api/faqs', { method: 'POST', body: payload }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['faqs'] })
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ['faqs'] })
+      await invalidateKgReviewQueries(qc)
     },
   })
 }
@@ -472,16 +520,15 @@ export function useRetrievalEvalCases(params: RetrievalEvalCaseListParams = {}) 
         },
       }),
     staleTime: 10_000,
-    placeholderData: (prev) => prev,
   })
 }
 
-// 保存评测用例；成功后刷新全部评测列表，让 latest_run 和状态保持一致。
+// 保存评测用例基础字段；运行快照只由列表接口的 latest_runs 返回。
 export function useSaveRetrievalEvalCase() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (payload: Partial<RetrievalEvalCase>) =>
-      requestJson<RetrievalEvalCase>('/api/retrieval/eval-cases', {
+    mutationFn: (payload: Partial<RetrievalEvalCaseRecord>) =>
+      requestJson<RetrievalEvalCaseRecord>('/api/retrieval/eval-cases', {
         method: 'POST',
         body: payload,
       }),
@@ -496,10 +543,16 @@ export function useRunRetrievalEvalCase() {
   const qc = useQueryClient()
   return useMutation({
     mutationKey: ['run-retrieval-eval-case'],
-    mutationFn: (caseId: string) =>
+    mutationFn: ({
+      caseId,
+      payload,
+    }: {
+      caseId: string
+      payload: RetrievalEvalRunPayload
+    }) =>
       requestJson<RetrievalEvalRun>(
         `/api/retrieval/eval-cases/${encodeURIComponent(caseId)}/run`,
-        { method: 'POST', body: {} },
+        { method: 'POST', body: payload },
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['retrieval-eval-cases'] })
@@ -533,6 +586,15 @@ export function useSaveRetrievalAlias() {
 
 // ───── Knowledge Graph ─────
 
+// 统一刷新 KG 审核读模型；三个 key 必须并行完成失效，调用者才能结束成功回调。
+export async function invalidateKgReviewQueries(queryClient: QueryClient): Promise<void> {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['kg-entities'] }),
+    queryClient.invalidateQueries({ queryKey: ['kg-relations'] }),
+    queryClient.invalidateQueries({ queryKey: ['kg-subgraph'] }),
+  ])
+}
+
 export interface KgEntityListParams {
   status?: string
   entity_type?: string
@@ -554,7 +616,7 @@ export function useKgEntities(params: KgEntityListParams = {}) {
         },
       }),
     staleTime: 10_000,
-    placeholderData: (prev) => prev,
+    refetchOnMount: 'always',
   })
 }
 
@@ -579,43 +641,53 @@ export function useKgRelations(params: KgRelationListParams = {}) {
         },
       }),
     staleTime: 10_000,
-    placeholderData: (prev) => prev,
+    refetchOnMount: 'always',
   })
 }
 
-// 确认实体并触发后端投影为可检索 KG chunk；成功后刷新 KG 列表和默认 FAQ/文档检索缓存。
+// 确认实体并触发后端投影；成功后统一刷新实体、关系和局部子图审核读模型。
 export function useConfirmKgEntity() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (id: string) =>
+    mutationFn: ({
+      id,
+      expectedRevision,
+    }: {
+      id: string
+      expectedRevision: number
+    }) =>
       requestJson<{ item: KgEntity }>(`/api/kg/entities/${encodeURIComponent(id)}/confirm`, {
         method: 'POST',
-        body: {},
+        body: { expected_revision: expectedRevision },
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kg-entities'] })
-      qc.invalidateQueries({ queryKey: ['kg-subgraph'] })
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
     },
   })
 }
 
-// 确认关系并触发后端投影；关系确认后局部子图也需要刷新。
+// 确认关系并触发后端投影；成功后复用同一组 KG 审核缓存失效规则。
 export function useConfirmKgRelation() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (id: string) =>
+    mutationFn: ({
+      id,
+      expectedRevision,
+    }: {
+      id: string
+      expectedRevision: number
+    }) =>
       requestJson<{ item: KgRelation }>(`/api/kg/relations/${encodeURIComponent(id)}/confirm`, {
         method: 'POST',
-        body: {},
+        body: { expected_revision: expectedRevision },
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kg-relations'] })
-      qc.invalidateQueries({ queryKey: ['kg-subgraph'] })
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
     },
   })
 }
 
-// 更新实体审核状态；用于停用误抽取实体或退回待审核。
+// 更新实体审核状态；端点变化可能联动关系，因此统一刷新三个 KG 查询族。
 export function useSetKgEntityStatus() {
   const qc = useQueryClient()
   return useMutation({
@@ -624,14 +696,13 @@ export function useSetKgEntityStatus() {
         method: 'POST',
         body: { status },
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kg-entities'] })
-      qc.invalidateQueries({ queryKey: ['kg-subgraph'] })
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
     },
   })
 }
 
-// 更新关系审核状态；用于停用误抽取关系或退回待审核。
+// 更新关系审核状态；成功后复用统一 KG 审核缓存失效规则。
 export function useSetKgRelationStatus() {
   const qc = useQueryClient()
   return useMutation({
@@ -640,14 +711,13 @@ export function useSetKgRelationStatus() {
         method: 'POST',
         body: { status },
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kg-relations'] })
-      qc.invalidateQueries({ queryKey: ['kg-subgraph'] })
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
     },
   })
 }
 
-// 读取局部子图；当前作为详情抽屉的关系邻域，后续 3D 视图也复用同一个返回结构。
+// 读取 usable 局部子图；响应明确区分 isolated 与 connected，不发送可切换 status。
 export function useKgSubgraph(centerEntityId: string | null, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ['kg-subgraph', centerEntityId],
@@ -656,27 +726,30 @@ export function useKgSubgraph(centerEntityId: string | null, options?: { enabled
         query: {
           center_entity_id: centerEntityId,
           hops: 1,
-          status: 'usable',
           limit: 40,
         },
       }),
     enabled: !!centerEntityId && (options?.enabled ?? true),
     staleTime: 10_000,
+    refetchOnMount: 'always',
   })
 }
 
-// 创建并同步执行 KG 抽取任务；只生成 needs_review 候选，不直接进入检索。
+// 创建并轮询 KG 抽取任务；completed 后统一刷新全部 KG 审核查询，failed 直接抛错。
 export function useCreateKgExtractionJob() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (payload: { source_id: string; source_type?: 'faq' | 'document_chunk'; source_chunk_id?: string }) =>
-      requestJson<KgExtractionJob>('/api/kg/extraction-jobs', {
+    mutationFn: async (payload: { source_id: string; source_type: 'faq' | 'document_chunk' }) => {
+      const queued = await requestJson<KgExtractionJob>('/api/kg/extraction-jobs', {
         method: 'POST',
         body: payload,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['kg-entities'] })
-      qc.invalidateQueries({ queryKey: ['kg-relations'] })
+      })
+      return waitForKgExtractionJob(queued, (jobId) =>
+        requestJson<KgExtractionJob>(`/api/kg/extraction-jobs/${encodeURIComponent(jobId)}`),
+      )
+    },
+    onSuccess: async () => {
+      await invalidateKgReviewQueries(qc)
     },
   })
 }

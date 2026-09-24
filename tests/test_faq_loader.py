@@ -61,6 +61,7 @@ def test_load_faq_rows_rejects_non_object_json_with_path_and_line(tmp_path):
 
 
 def test_import_faqs_embeds_upserts_and_returns_count(tmp_path):
+    """FAQ 导入应逐条生成向量、写库并返回计数。"""
     path = tmp_path / "faq.jsonl"
     rows = [
         {
@@ -86,6 +87,9 @@ def test_import_faqs_embeds_upserts_and_returns_count(tmp_path):
     )
 
     class FakeEmbeddings:
+        model = "embedding-current"
+        dimensions = 1
+
         def __init__(self):
             self.texts = []
 
@@ -97,8 +101,11 @@ def test_import_faqs_embeds_upserts_and_returns_count(tmp_path):
         def __init__(self):
             self.upserts = []
 
-        def upsert_faq(self, row, vector):
-            self.upserts.append((row, vector))
+        def upsert_faq(self, row, vector, *, embedding_model, embedding_dimensions):
+            """记录 FAQ 正文、向量及模型元数据。"""
+            self.upserts.append(
+                (row, vector, embedding_model, embedding_dimensions)
+            )
 
     embeddings = FakeEmbeddings()
     db = FakeDb()
@@ -107,4 +114,7 @@ def test_import_faqs_embeds_upserts_and_returns_count(tmp_path):
 
     assert count == 2
     assert embeddings.texts == [row["embedding_text"] for row in rows]
-    assert db.upserts == [(rows[0], [1.0]), (rows[1], [2.0])]
+    assert db.upserts == [
+        (rows[0], [1.0], "embedding-current", 1),
+        (rows[1], [2.0], "embedding-current", 1),
+    ]

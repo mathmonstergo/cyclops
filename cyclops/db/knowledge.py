@@ -4,14 +4,16 @@ import json
 from typing import Any
 
 from cyclops.db.builders import (
+    child_knowledge_chunk_index,
     clean_dict,
     clean_int,
     clean_list,
     compute_knowledge_chunk_hash,
+    document_embedding_source_fingerprint,
+    expected_document_knowledge_count,
     join_search_text,
 )
 from cyclops.db.models import (
-    RetrievedDocument,
     RetrievedKnowledgeChunk,
     format_vector,
     score_to_distance,
@@ -21,23 +23,124 @@ from cyclops.db.models import (
 class KnowledgeMixin:
     """统一知识单元写入 + 向量/关键词检索 + 父块上下文回填。"""
 
-    def upsert_knowledge_chunk(
+    def replace_document_chunk_embeddings(
         self,
-        row: dict[str, Any],
-        embedding: list[float] | None = None,
         *,
-        embedding_model: str | None = None,
-        embedding_dimensions: int | None = None,
-    ) -> dict[str, Any]:
-        """写入统一知识单元，关键约束是无向量时保持 pending 等待后续生成。"""
-        payload = self._knowledge_chunk_payload(
-            row,
-            embedding=embedding,
-            embedding_model=embedding_model,
-            embedding_dimensions=embedding_dimensions,
-        )
+        file_id: str,
+        chunk_id: str,
+        source_fingerprint: str,
+        items: list[tuple[dict[str, Any], list[float]]],
+        embedding_model: str,
+        embedding_dimensions: int,
+    ) -> list[dict[str, Any]]:
+        """原子替换一个来源切片的全部向量行，迟到任务必须通过实时来源指纹门禁。"""
+        if not file_id or not chunk_id or not source_fingerprint:
+            raise ValueError("document embedding source guard is required")
+        if not items:
+            raise ValueError("document embedding batch requires parent and child rows")
+        rows = [row for row, _embedding in items]
+        parent_rows = [row for row in rows if row.get("chunk_level") == "parent"]
+        child_rows = [row for row in rows if row.get("chunk_level") == "child"]
+        if len(parent_rows) != 1 or not child_rows:
+            raise ValueError("document embedding batch requires one parent and at least one child")
+        parent_id = parent_rows[0].get("id")
+        for row in rows:
+            if (
+                row.get("source_type") != "document"
+                or row.get("source_id") != file_id
+                or row.get("source_chunk_id") != chunk_id
+            ):
+                raise ValueError("document embedding row does not match source guard")
+            if row.get("chunk_level") == "child" and row.get("parent_chunk_id") != parent_id:
+                raise ValueError("document embedding child does not match batch parent")
+
         with self.connect() as conn:
-            return conn.execute(self._insert_knowledge_chunk_sql(), payload).fetchone()
+            import_file = conn.execute(
+                """
+                SELECT imp.*
+                FROM import_files imp
+                WHERE imp.id = %(file_id)s
+                FOR UPDATE OF imp
+                """,
+                {"file_id": file_id},
+            ).fetchone()
+            chunk = conn.execute(
+                """
+                SELECT chunk.*
+                FROM import_chunks chunk
+                WHERE chunk.id = %(chunk_id)s
+                  AND chunk.file_id = %(file_id)s
+                FOR UPDATE OF chunk
+                """,
+                {"file_id": file_id, "chunk_id": chunk_id},
+            ).fetchone()
+            source_available = bool(
+                import_file
+                and chunk
+                and import_file.get("status") in {"needs_review", "completed"}
+                and not import_file.get("is_disabled")
+                and not chunk.get("is_disabled")
+            )
+            current_fingerprint = (
+                document_embedding_source_fingerprint(import_file, chunk)
+                if source_available
+                else None
+            )
+            if not source_available or current_fingerprint != source_fingerprint:
+                raise ValueError("document embedding source changed or became unavailable")
+            self._validate_document_embedding_source_rows(rows, chunk)
+            conn.execute(
+                """
+                DELETE FROM knowledge_chunks
+                WHERE source_type = 'document'
+                  AND source_id = %(file_id)s
+                  AND source_chunk_id = %(chunk_id)s
+                """,
+                {"file_id": file_id, "chunk_id": chunk_id},
+            )
+            inserted: list[dict[str, Any]] = []
+            for row, embedding in items:
+                payload = self._knowledge_chunk_payload(
+                    row,
+                    embedding=embedding,
+                    embedding_model=embedding_model,
+                    embedding_dimensions=embedding_dimensions,
+                )
+                saved = conn.execute(self._insert_knowledge_chunk_sql(), payload).fetchone()
+                inserted.append(saved)
+            return inserted
+
+    @staticmethod
+    def _validate_document_embedding_source_rows(
+        rows: list[dict[str, Any]],
+        chunk: dict[str, Any],
+    ) -> None:
+        """按锁内实时切片校验完整确定性行，防止残缺批次覆盖 parent/children。"""
+        chunk_id = str(chunk["id"])
+        parent_id = f"kc_document_{chunk_id}"
+        parent_index = int(chunk.get("chunk_index", 0))
+        expected_count = expected_document_knowledge_count(chunk)
+        expected_shape = [(parent_id, "parent", None, parent_index)]
+        expected_shape.extend(
+            (
+                f"{parent_id}_child_{child_index}",
+                "child",
+                parent_id,
+                child_knowledge_chunk_index(parent_index, child_index),
+            )
+            for child_index in range(1, expected_count)
+        )
+        actual_shape = [
+            (
+                row.get("id"),
+                row.get("chunk_level"),
+                row.get("parent_chunk_id"),
+                row.get("chunk_index"),
+            )
+            for row in rows
+        ]
+        if actual_shape != expected_shape:
+            raise ValueError("document embedding batch does not match deterministic source rows")
 
     @staticmethod
     def _knowledge_chunk_payload(
@@ -47,7 +150,7 @@ class KnowledgeMixin:
         embedding_model: str | None = None,
         embedding_dimensions: int | None = None,
     ) -> dict[str, Any]:
-        """构造统一知识单元写入参数，关键约束是供普通写入和 KG 事务投影复用。"""
+        """构造统一知识单元写入参数，关键约束是只供 FAQ、文档和 KG 的受控事务复用。"""
         embedding_text = str(row.get("embedding_text") or row["content"]).strip()
         return {
             "id": row["id"],
@@ -80,52 +183,6 @@ class KnowledgeMixin:
             "content_hash": row.get("content_hash")
             or compute_knowledge_chunk_hash({**row, "embedding_text": embedding_text}),
         }
-
-    def search(
-        self,
-        query_embedding: list[float],
-        *,
-        top_k: int,
-        min_score: float,
-        status: str = "usable",
-        confidence: str = "high",
-    ) -> list[RetrievedDocument]:
-        sql = """
-        SELECT
-            id, question, answer, category, tags, source_date, confidence, status,
-            1 - (embedding <=> %(embedding)s::vector) AS score
-        FROM faq_documents
-        WHERE status = %(status)s
-          AND embedding_status = 'ready'
-          AND embedding IS NOT NULL
-          AND confidence = %(confidence)s
-          AND (embedding <=> %(embedding)s::vector) <= %(max_distance)s
-        ORDER BY embedding <=> %(embedding)s::vector
-        LIMIT %(top_k)s
-        """
-        params = {
-            "embedding": format_vector(query_embedding),
-            "status": status,
-            "confidence": confidence,
-            "max_distance": score_to_distance(min_score),
-            "top_k": top_k,
-        }
-        with self.connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [
-            RetrievedDocument(
-                id=row["id"],
-                question=row["question"],
-                answer=row["answer"],
-                category=row["category"],
-                tags=row["tags"] or [],
-                source_date=row["source_date"],
-                confidence=row["confidence"],
-                status=row["status"],
-                score=float(row["score"]),
-            )
-            for row in rows
-        ]
 
     def search_knowledge(
         self,
@@ -267,7 +324,7 @@ class KnowledgeMixin:
         """集中维护统一知识单元向量检索 SQL，后续混合检索会复用同一候选表。
 
         LEFT JOIN import_files / import_chunks 是为了让"文档级 / 切片级禁用"立即在检索层生效，
-        不需要重新生成 embedding；FAQ 来源再 LEFT JOIN faq_documents 读**实时** status——禁用/待复核（status≠usable）即时排除，改状态无需重嵌（kc.status 是投影快照，故以 fq.status 为准）。
+        不需要重新生成 embedding；FAQ 必须同时满足实时审核状态和实时向量状态，不能读取旧投影。
         """
         return """
         SELECT
@@ -280,17 +337,33 @@ class KnowledgeMixin:
         LEFT JOIN import_files imp
             ON kc.source_type = 'document' AND imp.id = kc.source_id
         LEFT JOIN import_chunks ic
-            ON kc.source_type = 'document' AND ic.id = kc.source_chunk_id
+            ON kc.source_type = 'document'
+           AND ic.id = kc.source_chunk_id
+           AND ic.file_id = kc.source_id
         LEFT JOIN faq_documents fq
             ON kc.source_type = 'faq' AND fq.id = kc.source_id
-        WHERE COALESCE(fq.status, kc.status) = %(status)s
+        WHERE kc.source_type IN ('faq', 'document')
+          AND (
+                (
+                    kc.source_type = 'faq'
+                    AND fq.status = %(status)s
+                    AND fq.embedding_status = 'ready'
+                )
+                OR (kc.source_type = 'document' AND kc.status = %(status)s)
+              )
           AND kc.embedding_status = 'ready'
           AND kc.embedding IS NOT NULL
-          AND kc.source_type NOT IN ('kg_entity', 'kg_relation')
           AND (kc.embedding <=> %(embedding)s::vector) <= %(max_distance)s
-          AND COALESCE(imp.is_disabled, false) = false
-          AND COALESCE(ic.is_disabled, false) = false
-          AND (kc.source_type <> 'document' OR kc.chunk_level <> 'parent')
+          AND (
+              kc.source_type <> 'document'
+              OR (
+                  imp.id IS NOT NULL
+                  AND ic.id IS NOT NULL
+                  AND imp.is_disabled = false
+                  AND ic.is_disabled = false
+              )
+          )
+          AND (kc.source_type <> 'document' OR kc.chunk_level = 'child')
         ORDER BY kc.embedding <=> %(embedding)s::vector
         LIMIT %(top_k)s
         """
@@ -299,7 +372,7 @@ class KnowledgeMixin:
     def _search_knowledge_text_sql() -> str:
         """集中维护统一知识单元关键词检索 SQL，作为混合召回的第二路候选。
 
-        与向量检索一致；FAQ 走 fq.status 实时口径（COALESCE(fq.status, kc.status)），文档/切片仍按 is_disabled 过滤。
+        与向量检索使用同一 ready/status 门禁，文档和切片仍按 is_disabled 过滤。
         """
         return """
         SELECT
@@ -324,14 +397,31 @@ class KnowledgeMixin:
         LEFT JOIN import_files imp
             ON kc.source_type = 'document' AND imp.id = kc.source_id
         LEFT JOIN import_chunks ic
-            ON kc.source_type = 'document' AND ic.id = kc.source_chunk_id
+            ON kc.source_type = 'document'
+           AND ic.id = kc.source_chunk_id
+           AND ic.file_id = kc.source_id
         LEFT JOIN faq_documents fq
             ON kc.source_type = 'faq' AND fq.id = kc.source_id
-        WHERE COALESCE(fq.status, kc.status) = %(status)s
-          AND kc.source_type NOT IN ('kg_entity', 'kg_relation')
-          AND COALESCE(imp.is_disabled, false) = false
-          AND COALESCE(ic.is_disabled, false) = false
-          AND (kc.source_type <> 'document' OR kc.chunk_level <> 'parent')
+        WHERE kc.source_type IN ('faq', 'document')
+          AND (
+                (
+                    kc.source_type = 'faq'
+                    AND fq.status = %(status)s
+                    AND fq.embedding_status = 'ready'
+                )
+                OR (kc.source_type = 'document' AND kc.status = %(status)s)
+              )
+          AND kc.embedding_status = 'ready'
+          AND (
+              kc.source_type <> 'document'
+              OR (
+                  imp.id IS NOT NULL
+                  AND ic.id IS NOT NULL
+                  AND imp.is_disabled = false
+                  AND ic.is_disabled = false
+              )
+          )
+          AND (kc.source_type <> 'document' OR kc.chunk_level = 'child')
           AND (
               kc.source_title ILIKE %(query_like)s
               OR kc.content ILIKE %(query_like)s
@@ -376,15 +466,25 @@ class KnowledgeMixin:
           ON parent.id = child.parent_chunk_id
          AND parent.source_type = child.source_type
          AND parent.source_id = child.source_id
+         AND parent.source_chunk_id = child.source_chunk_id
         LEFT JOIN import_files imp
             ON parent.source_type = 'document' AND imp.id = parent.source_id
         LEFT JOIN import_chunks ic
-            ON parent.source_type = 'document' AND ic.id = parent.source_chunk_id
+            ON parent.source_type = 'document'
+           AND ic.id = parent.source_chunk_id
+           AND ic.file_id = parent.source_id
         WHERE child.id = ANY(%(child_ids)s::text[])
           AND parent.chunk_level = 'parent'
           AND parent.status = %(status)s
           AND parent.embedding_status = 'ready'
-          AND COALESCE(imp.is_disabled, false) = false
-          AND COALESCE(ic.is_disabled, false) = false
+          AND (
+              parent.source_type <> 'document'
+              OR (
+                  imp.id IS NOT NULL
+                  AND ic.id IS NOT NULL
+                  AND imp.is_disabled = false
+                  AND ic.is_disabled = false
+              )
+          )
         ORDER BY parent.source_type, parent.source_id, parent.source_chunk_id, parent.id
         """

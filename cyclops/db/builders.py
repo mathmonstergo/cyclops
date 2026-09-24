@@ -4,6 +4,11 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from cyclops.chunking import normalize_children_delimiter, split_with_pattern
+
+
+DOCUMENT_CHILD_INDEX_OFFSET = 1
+
 
 def count_job_item_statuses(items: list[dict[str, Any]]) -> dict[str, int]:
     """统计生成任务子项状态，写入任务摘要字段。"""
@@ -54,6 +59,88 @@ def clean_block_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def document_child_sources(
+    chunk: dict[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """选择文档 child 来源，关键约束是结构块、delimiter、整段正文依次择一。"""
+    blocks = [
+        block
+        for block in clean_block_list(chunk.get("source_blocks"))
+        if str(block.get("text") or "").strip()
+    ]
+    if blocks:
+        return [], blocks
+
+    pattern = normalize_children_delimiter(chunk.get("children_delimiter"))
+    if pattern:
+        delimiter_children = split_with_pattern(
+            str(chunk.get("source_text") or ""),
+            pattern,
+        )
+        if delimiter_children:
+            return delimiter_children, []
+    return [str(chunk.get("source_text") or "")], []
+
+
+def document_embedding_source_fingerprint(
+    import_file: dict[str, Any],
+    chunk: dict[str, Any],
+) -> str:
+    """计算文档向量来源指纹，关键约束是覆盖所有会改变投影或来源生命周期的字段。"""
+    payload = {
+        "file": {
+            "id": str(import_file.get("id") or ""),
+            "original_name": str(import_file.get("original_name") or ""),
+            "file_type": str(import_file.get("file_type") or ""),
+            "parser": str(import_file.get("parser") or ""),
+            "chunker_type": str(import_file.get("chunker_type") or ""),
+            "status": str(import_file.get("status") or ""),
+            "is_disabled": bool(import_file.get("is_disabled")),
+        },
+        "chunk": {
+            "id": str(chunk.get("id") or ""),
+            "file_id": str(chunk.get("file_id") or ""),
+            "chunk_index": int(chunk.get("chunk_index", 0)),
+            "section_path": clean_list(chunk.get("section_path")),
+            "page_start": clean_int(chunk.get("page_start")),
+            "page_end": clean_int(chunk.get("page_end")),
+            "block_type": str(chunk.get("block_type") or ""),
+            "source_offsets": clean_dict(chunk.get("source_offsets")),
+            "source_blocks": clean_block_list(chunk.get("source_blocks")),
+            "children_delimiter": str(chunk.get("children_delimiter") or ""),
+            "start_at": str(chunk.get("start_at") or ""),
+            "end_at": str(chunk.get("end_at") or ""),
+            "message_count": int(chunk.get("message_count", 0)),
+            "keywords": clean_list(chunk.get("keywords")),
+            "source_text": str(chunk.get("source_text") or ""),
+            "status": str(chunk.get("status") or ""),
+            "questions": clean_list(chunk.get("questions")),
+            "is_disabled": bool(chunk.get("is_disabled")),
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def expected_document_knowledge_count(chunk: dict[str, Any]) -> int:
+    """计算 parent + child 预期行数，必须与实际 child 生成共用同一选择结果。"""
+    child_texts, child_blocks = document_child_sources(chunk)
+    return 1 + len(child_texts or child_blocks)
+
+
+def child_knowledge_chunk_index(parent_index: int, child_index: int) -> int:
+    """为文档 child 生成确定性负索引，关键约束是不与 parent 正编号冲突。"""
+    parent = max(int(parent_index), 0)
+    child = max(int(child_index), 0)
+    paired = (parent + child) * (parent + child + 1) // 2 + child
+    return -(paired + DOCUMENT_CHILD_INDEX_OFFSET)
 
 
 def clean_int(value: Any) -> int | None:
@@ -217,22 +304,28 @@ def build_faq_knowledge_chunk_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def build_document_knowledge_chunk_row(
     chunk: dict[str, Any],
-    import_file: dict[str, Any] | None = None,
+    import_file: dict[str, Any],
+    *,
+    knowledge_chunk_id: str,
 ) -> dict[str, Any]:
-    """把导入文档切片映射为统一知识单元，并补充用于精准召回的结构上下文。"""
-    import_file = import_file or {}
+    """把文档来源映射为知识行，文件、来源切片与知识行三类 ID 必须明确分离。"""
+    chunk_file_id = str(chunk["file_id"]).strip()
+    source_id = str(import_file["id"]).strip()
+    if chunk_file_id != source_id:
+        raise ValueError("chunk.file_id must match import_file.id")
     source_text_raw = str(chunk.get("source_text", ""))
     source_text = source_text_raw if source_text_raw.strip() else ""
     keywords = clean_list(chunk.get("keywords"))
     source_title = str(import_file.get("original_name") or chunk.get("file_id") or "").strip()
-    source_id = str(import_file.get("id") or chunk.get("file_id")).strip()
     section_path = clean_list(chunk.get("section_path"))
     page_start = clean_int(chunk.get("page_start"))
     page_end = clean_int(chunk.get("page_end"))
     block_type = str(chunk.get("block_type") or "").strip() or None
     source_offsets = clean_dict(chunk.get("source_offsets"))
     source_blocks = clean_block_list(chunk.get("source_blocks"))
-    chunk_level = str(chunk.get("chunk_level") or "chunk").strip() or "chunk"
+    chunk_level = chunk.get("chunk_level")
+    if chunk_level not in {"parent", "child"}:
+        raise ValueError("document chunk_level must be parent or child")
     questions = clean_list(chunk.get("questions"))
     embedding_text = build_document_embedding_text(
         source_title=source_title,
@@ -263,7 +356,7 @@ def build_document_knowledge_chunk_row(
         "questions": questions,
     }
     row = {
-        "id": f"kc_document_{chunk['id']}",
+        "id": f"kc_document_{knowledge_chunk_id}",
         "source_type": "document",
         "source_id": source_id,
         "source_chunk_id": chunk.get("id"),

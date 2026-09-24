@@ -1,6 +1,6 @@
 // 右侧 Debug 抽屉：显示当前会话最近一条助手消息的完整流程（step list + 命中切片明细）。
 // 默认关闭；从顶栏的「流程详情」按钮或助手气泡上的「查看 N 条来源」唤起。
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Activity,
@@ -263,27 +263,14 @@ function SourceCard({
   registerRef: (key: string, node: HTMLElement | null) => void
 }) {
   const [expanded, setExpanded] = useState(false)
+  const contentId = useId()
   const isFaq = src.source_type === 'faq'
-  // 标题：FAQ 显示 question；文档显示 source_title（文件名）
-  const title =
-    src.source_title ||
-    src.title ||
-    (isFaq ? src.question : undefined) ||
-    `来源 ${index + 1}`
-  // 正文：document 用 content，FAQ 用 answer（fallback content / text）
-  const fullText =
-    (isFaq ? src.answer : undefined) ||
-    src.content ||
-    src.text ||
-    ''
-  const parentText = (src.metadata?.parent_content as string | undefined) || ''
-  const score = typeof src.score === 'number' ? src.score : undefined
-  const channels = Array.isArray(src.retrieval_channels) ? src.retrieval_channels : []
-  const page =
-    typeof src.page_start === 'number'
-      ? src.page_start
-      : (src.metadata?.page_start as number | undefined)
-  const hasMore = fullText.length > 200 || !!parentText
+  const title = src.source_title || `来源 ${index + 1}`
+  const fullText = src.content
+  const score = src.score
+  const channels = src.retrieval_channels || []
+  const page = src.page_start
+  const hasMore = fullText.length > 200
 
   return (
     <article
@@ -291,12 +278,18 @@ function SourceCard({
       className={cn(
         'rounded-(--radius-control) border border-(--color-border) bg-(--color-surface)',
         'transition-colors',
-        hasMore && 'cursor-pointer hover:border-(--color-primary)/30',
+        hasMore && 'hover:border-(--color-primary)/30',
         highlighted && 'assistant-flash-highlight',
       )}
-      onClick={() => hasMore && setExpanded((v) => !v)}
     >
-      <div className="flex items-center gap-1.5 px-3 py-2 text-[12px]">
+      <button
+        type="button"
+        disabled={!hasMore}
+        aria-expanded={hasMore ? expanded : undefined}
+        aria-controls={hasMore ? contentId : undefined}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] enabled:cursor-pointer disabled:cursor-default"
+      >
         {channels.map((c) => (
           <span
             key={c}
@@ -342,18 +335,19 @@ function SourceCard({
             )}
           />
         )}
-      </div>
-      {(fullText || parentText) && (
-        <AnimatePresence initial={false} mode="wait">
-          {expanded ? (
-            <motion.div
-              key="full"
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              transition={{ duration: dur.base, ease: ease.out }}
-              className="overflow-hidden"
-            >
+      </button>
+      {fullText && (
+        <div id={contentId}>
+          <AnimatePresence initial={false} mode="wait">
+            {expanded ? (
+              <motion.div
+                key="full"
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: dur.base, ease: ease.out }}
+                className="overflow-hidden"
+              >
               {isFaq && src.question && (
                 <div className="border-t border-(--color-border-soft) px-3 py-2 text-[12px] leading-[1.7]">
                   <div className="mb-1 text-[10px] uppercase tracking-wider text-(--color-text-faint)">
@@ -376,26 +370,17 @@ function SourceCard({
                   </div>
                 </div>
               )}
-              {parentText && (
-                <div className="border-t border-(--color-border-soft) px-3 py-2 text-[12px] leading-[1.7]">
-                  <div className="mb-1 text-[10px] uppercase tracking-wider text-(--color-text-faint)">
-                    父切片上下文
-                  </div>
-                  <div className="text-(--color-text-faint) whitespace-pre-wrap break-words">
-                    {parentText}
-                  </div>
-                </div>
-              )}
-            </motion.div>
-          ) : (
-            <div
-              key="preview"
-              className="line-clamp-3 px-3 pb-2 text-[12px] leading-[1.6] text-(--color-text-muted)"
-            >
-              {fullText || parentText}
-            </div>
-          )}
-        </AnimatePresence>
+              </motion.div>
+            ) : (
+              <div
+                key="preview"
+                className="line-clamp-3 px-3 pb-2 text-[12px] leading-[1.6] text-(--color-text-muted)"
+              >
+                {fullText}
+              </div>
+            )}
+          </AnimatePresence>
+        </div>
       )}
     </article>
   )

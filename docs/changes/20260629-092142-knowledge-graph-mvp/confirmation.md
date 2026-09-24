@@ -1,5 +1,9 @@
 # Confirmation
 
+> [!IMPORTANT]
+> 本文仅记录 2026-06-29 的历史状态。KG 当前唯一契约已由
+> `docs/changes/20260714-092948-knowledge-graph-retrieval-review/` 取代；不得按本文恢复同步抽取、来源推断或旧审核路径。
+
 ## 2026-06-29
 
 * 用户确认可以开始知识图谱方向。

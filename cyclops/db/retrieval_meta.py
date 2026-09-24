@@ -7,6 +7,15 @@ from typing import Any
 from cyclops.db.builders import clean_list
 
 
+RETRIEVAL_EVAL_CONTRACT_VERSION = 2
+RETRIEVAL_EVAL_BASELINE_STRATEGY = "retrieval_hybrid_v1"
+RETRIEVAL_EVAL_KG_DEBUG_STRATEGY = "retrieval_hybrid_v1_kg_debug"
+RETRIEVAL_EVAL_STRATEGIES = (
+    RETRIEVAL_EVAL_BASELINE_STRATEGY,
+    RETRIEVAL_EVAL_KG_DEBUG_STRATEGY,
+)
+
+
 class RetrievalMetaMixin:
     """检索评测用例 / 评测运行 / 别名词典。"""
 
@@ -58,7 +67,7 @@ class RetrievalMetaMixin:
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """列出检索评测用例，并带最近运行结果供页面刷新后回放。"""
+        """列出评测用例，并按固定顺序返回两种 current strategy 的最新运行。"""
         clauses = []
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status:
@@ -68,22 +77,38 @@ class RetrievalMetaMixin:
         rows_sql = f"""
         SELECT
             c.*,
-            latest.latest_run
+            latest.latest_runs
         FROM retrieval_eval_cases c
         LEFT JOIN LATERAL (
-            SELECT jsonb_build_object(
-                'id', run.id,
-                'case_id', run.case_id,
-                'strategy', run.strategy,
-                'retrieved_items', run.retrieved_items,
-                'metrics', run.metrics,
-                'analysis', run.analysis,
-                'created_at', run.created_at
-            ) AS latest_run
-            FROM retrieval_eval_runs run
-            WHERE run.case_id = c.id
-            ORDER BY run.created_at DESC
-            LIMIT 1
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'id', run.id,
+                        'case_id', run.case_id,
+                        'strategy', run.strategy,
+                        'retrieved_items', run.retrieved_items,
+                        'metrics', run.metrics,
+                        'analysis', run.analysis,
+                        'created_at', run.created_at
+                    )
+                    ORDER BY CASE run.strategy
+                        WHEN 'retrieval_hybrid_v1' THEN 1
+                        WHEN 'retrieval_hybrid_v1_kg_debug' THEN 2
+                    END
+                ),
+                '[]'::jsonb
+            ) AS latest_runs
+            FROM (
+                SELECT DISTINCT ON (run.strategy) run.*
+                FROM retrieval_eval_runs run
+                WHERE run.case_id = c.id
+                  AND run.strategy IN (
+                      'retrieval_hybrid_v1',
+                      'retrieval_hybrid_v1_kg_debug'
+                  )
+                  AND run.analysis->'contract_version' = '2'::jsonb
+                ORDER BY run.strategy, run.created_at DESC, run.id DESC
+            ) AS run
         ) latest ON true
         {where}
         ORDER BY c.updated_at DESC, c.id DESC
@@ -96,14 +121,24 @@ class RetrievalMetaMixin:
         return {"items": rows, "total": total}
 
     def record_retrieval_eval_run(self, row: dict[str, Any]) -> dict[str, Any]:
-        """保存单次检索评测运行结果，关键约束是完整保留候选和指标用于回放。"""
+        """保存 current 评测运行，版本只接受精确整数 2。"""
+        strategy = row.get("strategy")
+        if strategy not in RETRIEVAL_EVAL_STRATEGIES:
+            raise ValueError("retrieval eval strategy must be an explicit current strategy")
+        analysis = row.get("analysis")
+        contract_version = analysis.get("contract_version") if isinstance(analysis, dict) else None
+        if (
+            type(contract_version) is not int
+            or contract_version != RETRIEVAL_EVAL_CONTRACT_VERSION
+        ):
+            raise ValueError("retrieval eval analysis contract_version must be 2")
         payload = {
             "id": row.get("id") or f"eval_run_{uuid.uuid4().hex[:12]}",
             "case_id": row["case_id"],
-            "strategy": row.get("strategy", "retrieval_hybrid_v1"),
-            "retrieved_items": json.dumps(row.get("retrieved_items", []), ensure_ascii=False),
-            "metrics": json.dumps(row.get("metrics", {}), ensure_ascii=False),
-            "analysis": json.dumps(row.get("analysis", {}), ensure_ascii=False),
+            "strategy": strategy,
+            "retrieved_items": json.dumps(row["retrieved_items"], ensure_ascii=False),
+            "metrics": json.dumps(row["metrics"], ensure_ascii=False),
+            "analysis": json.dumps(analysis, ensure_ascii=False),
         }
         sql = """
         INSERT INTO retrieval_eval_runs (

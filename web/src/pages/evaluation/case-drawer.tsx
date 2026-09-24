@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { Save } from 'lucide-react'
-import type { RetrievalEvalCase } from '@/api/schemas'
+import type { RetrievalEvalCase, RetrievalEvalCaseRecord } from '@/api/schemas'
 import { Button } from '@/components/ui/button'
 import {
   Drawer,
@@ -49,7 +49,7 @@ export function CaseDrawer({
   open: boolean
   item: RetrievalEvalCase | null
   onOpenChange: (open: boolean) => void
-  onSaved: (item: RetrievalEvalCase) => void
+  onSaved: (item: RetrievalEvalCaseRecord) => void
 }) {
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
@@ -88,7 +88,7 @@ function CaseDrawerForm({
 }: {
   item: RetrievalEvalCase | null
   onOpenChange: (open: boolean) => void
-  onSaved: (item: RetrievalEvalCase) => void
+  onSaved: (item: RetrievalEvalCaseRecord) => void
 }) {
   const [form, setForm] = useState<CaseFormState>(() => formStateFromItem(item))
   const saveCase = useSaveRetrievalEvalCase()

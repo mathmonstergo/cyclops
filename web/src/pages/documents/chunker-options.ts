@@ -1,4 +1,6 @@
-export type DocumentChunkerType = 'naive' | 'manual' | 'qa' | 'table'
+import type { DocumentChunkerType } from '@/api/schemas'
+
+export type { DocumentChunkerType } from '@/api/schemas'
 
 export const DOCUMENT_CHUNKER_OPTIONS: {
   value: DocumentChunkerType
@@ -17,14 +19,15 @@ const DOCUMENT_CHUNKER_LABELS: Record<DocumentChunkerType, string> = {
   table: 'Table',
 }
 
-// 规范化后端返回的 chunker 字段；旧数据或未知值在 UI 上按 naive 展示。
-export function normalizeDocumentChunkerType(value: unknown): DocumentChunkerType {
-  const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
-  if (raw === 'manual' || raw === 'qa' || raw === 'table') return raw
-  return 'naive'
+// 校验后端返回的 chunker 字段；缺失、大小写别名和未知值都直接暴露契约错误。
+export function requireDocumentChunkerType(value: unknown): DocumentChunkerType {
+  if (value === 'naive' || value === 'manual' || value === 'qa' || value === 'table') {
+    return value
+  }
+  throw new Error('document chunker_type must be canonical')
 }
 
 // 统一列表和抽屉的 chunker 标签，避免同一枚举在多个组件里重复硬编码。
 export function documentChunkerLabel(value: unknown): string {
-  return DOCUMENT_CHUNKER_LABELS[normalizeDocumentChunkerType(value)]
+  return DOCUMENT_CHUNKER_LABELS[requireDocumentChunkerType(value)]
 }

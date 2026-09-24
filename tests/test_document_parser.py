@@ -90,6 +90,15 @@ def test_build_import_chunks_from_blocks_batches_text_with_evidence():
     ]
 
 
+def test_build_import_chunks_from_blocks_rejects_dictionary_alias():
+    """解析完成后的 chunker 只接受 ParsedBlock，不为测试或调用层保留字典别名。"""
+    with pytest.raises(TypeError, match="blocks must contain ParsedBlock"):
+        build_import_chunks_from_blocks(
+            "imp_1",
+            [{"text": "账号登录", "block_type": "title"}],
+        )
+
+
 def test_extract_blocks_from_mineru_content_list_preserves_ragflow_position_tag():
     """MinerU bbox 会按 RAGFlow 的 @@page 坐标 tag 保存到结构字段。"""
     payload = {

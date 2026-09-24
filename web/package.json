@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run typecheck && vite build",
     "lint": "eslint .",
-    "test": "node --test \"src/**/*.test.ts\"",
+    "test": "npm run typecheck:test && node --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc -b && npm run typecheck:test",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -48,6 +50,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
+    "happy-dom": "20.10.6",
     "postcss": "^8.5.15",
     "tailwindcss": "^4.3.0",
     "typescript": "~6.0.2",

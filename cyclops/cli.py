@@ -7,9 +7,10 @@ import sys
 from cyclops.config import Settings
 from cyclops.db import Database
 from cyclops.faq_loader import import_faqs
-from cyclops.llm import ChatClient, EmbeddingClient
+from cyclops.llm import ChatClient, EmbeddingClient, RerankClient
 from cyclops.rag import RagService, load_system_prompt
 from cyclops.rag_tool import RagTool
+from cyclops.retrieval import HybridRetrievalService
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,7 +19,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check-config")
     sub.add_parser("init-db")
-    sub.add_parser("sync-knowledge-chunks")
     import_parser = sub.add_parser("import-faq")
     import_parser.add_argument("--path", default="data/faqs.jsonl")
     search_parser = sub.add_parser("search")
@@ -38,25 +38,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_rag(settings: Settings) -> RagService:
-    return RagService(
+def build_hybrid_retrieval(
+    settings: Settings,
+    *,
+    database: Database | None = None,
+) -> HybridRetrievalService:
+    """按当前设置装配唯一混合检索服务，可复用调用方已有数据库连接池。"""
+    return HybridRetrievalService(
+        database=database if database is not None else Database(settings.database_url),
         embeddings=EmbeddingClient.from_settings(settings),
-        db=Database(settings.database_url),
-        chat=ChatClient.from_settings(settings),
-        system_prompt=load_system_prompt(),
+        rerank=RerankClient.from_settings(settings),
         top_k=settings.rag_top_k,
         min_score=settings.rag_min_score,
     )
 
 
-def build_rag_tool(settings: Settings) -> RagTool:
-    return RagTool(
-        embeddings=EmbeddingClient.from_settings(settings),
-        db=Database(settings.database_url),
+def build_rag(settings: Settings) -> RagService:
+    """装配正式回答服务，检索固定复用统一混合服务。"""
+    return RagService(
+        retrieval=build_hybrid_retrieval(settings),
         chat=ChatClient.from_settings(settings),
         system_prompt=load_system_prompt(),
-        top_k=settings.rag_top_k,
-        min_score=settings.rag_min_score,
+    )
+
+
+def build_rag_tool(
+    settings: Settings,
+    *,
+    database: Database | None = None,
+) -> RagTool:
+    """装配 agent 工具，search 与 answer 共用唯一混合检索服务。"""
+    return RagTool(
+        retrieval=build_hybrid_retrieval(settings, database=database),
+        chat=ChatClient.from_settings(settings),
+        system_prompt=load_system_prompt(),
     )
 
 
@@ -76,10 +91,6 @@ def main(argv: list[str] | None = None) -> int:
         Database(settings.database_url).init_schema()
         print("database schema ok")
         return 0
-    if args.command == "sync-knowledge-chunks":
-        count = Database(settings.database_url).sync_ready_faq_knowledge_chunks()
-        print(f"synced {count} ready faq knowledge chunks")
-        return 0
     if args.command == "import-faq":
         count = import_faqs(
             args.path,
@@ -90,14 +101,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "search":
         question = args.question or input("question: ")
-        embedding = EmbeddingClient.from_settings(settings).embed(question)
-        docs = Database(settings.database_url).search(
-            embedding,
-            top_k=settings.rag_top_k,
-            min_score=settings.rag_min_score,
+        result = build_hybrid_retrieval(settings).retrieve(
+            question,
+            include_parent_context=False,
+            use_kg=False,
         )
-        for doc in docs:
-            print(f"{doc.score:.2f} {doc.id} {doc.question}")
+        for candidate in result.candidates:
+            document = candidate.document
+            title = document.source_title or document.source_id
+            print(f"{document.score:.2f} {document.id} {title}")
         return 0
     if args.command == "ask":
         question = args.question or input("question: ")

@@ -1,12 +1,14 @@
 // 前端 TS 类型：从 admin_server.py 的 normalize_*_payload / DB rows 字段提炼。
-// 只覆盖 3 个迁移页面用到的字段；未列出的字段仍可通过 `[key: string]: unknown` 兼容。
+// 既有迁移页面只列出当前使用字段；检索评测与 KG 的 0→1 DTO 在各自区段保持封闭契约。
+
+export type DocumentChunkerType = 'naive' | 'manual' | 'qa' | 'table'
 
 export interface ImportFile {
   id: string
   original_name: string
   file_type: string
   parser: string
-  chunker_type: string
+  chunker_type: DocumentChunkerType
   status:
     | 'pending'
     | 'processing'
@@ -124,37 +126,32 @@ export interface FaqListResponse {
 // Assistant
 
 export interface AssistantSource {
-  id?: string
-  source_id?: string
-  source_type?: 'document' | 'faq' | string
-  source_chunk_id?: string
-  parent_chunk_id?: string
-  chunk_level?: 'parent' | 'child' | 'chunk' | string
-  chunk_id?: string
-  source_title?: string
-  title?: string
-  section_path?: string[]
-  page_start?: number | null
-  page_end?: number | null
-  block_type?: string | null
-  source_offsets?: Record<string, unknown>
-  // 正文：document 切片时是切片文本；FAQ 时是 answer。
-  content?: string
-  text?: string
-  question?: string
-  answer?: string
-  category?: string | null
-  tags?: string[]
-  score?: number
+  id: string
+  source_id: string
+  source_type: 'document' | 'faq'
+  source_chunk_id: string | null
+  parent_chunk_id: string | null
+  chunk_level: string
+  source_title: string | null
+  section_path: string[]
+  page_start: number | null
+  page_end: number | null
+  block_type: string | null
+  source_offsets: Record<string, unknown>
+  content: string
+  question: string
+  answer: string
+  category: string | null
+  tags: string[]
+  source_date: string | null
+  confidence: string | null
+  status: string
+  score: number
   retrieval_channels?: string[]
-  metadata?: Record<string, unknown> & {
-    parent_content?: string
-    file_name?: string
-    section_path?: string[]
-    page_start?: number | null
-    page_end?: number | null
-  }
-  [key: string]: unknown
+  fused_score?: number | null
+  vector_score?: number | null
+  keyword_score?: number | null
+  metadata: Record<string, unknown>
 }
 
 export interface AssistantStreamPayload {
@@ -242,10 +239,24 @@ export interface RetrievalEvalMetrics {
   recall_at_k?: number
   mrr?: number
   hit_rate_at_1?: number
-  [key: string]: unknown
+}
+
+export type RetrievalEvalRunPayload = Record<string, never> | { use_kg: true }
+
+export interface RetrievalKgFactMatch {
+  fact_chunk_id: string
+  fact_id: string
+  fact_type: 'kg_entity' | 'kg_relation'
+  fact_rank: number
+  fact_score: number
+}
+
+export interface RetrievalKgFactAnalysis extends RetrievalKgFactMatch {
+  expanded_candidate_ids: string[]
 }
 
 export interface RetrievalEvalAnalysis {
+  contract_version: 2
   intent?: string
   confidence?: string
   query?: string
@@ -254,47 +265,49 @@ export interface RetrievalEvalAnalysis {
   query_terms?: string[]
   vector_count?: number
   keyword_count?: number
+  use_kg: boolean
+  kg_fact_count: number
+  kg_expanded_candidate_count: number
+  kg_facts: RetrievalKgFactAnalysis[]
   reason?: string
-  [key: string]: unknown
 }
+
+export type RetrievalEvalStrategyId =
+  | 'retrieval_hybrid_v1'
+  | 'retrieval_hybrid_v1_kg_debug'
 
 export interface RetrievalEvalItem {
   id: string
   source_id: string
-  source_type: string
-  source_chunk_id?: string | null
-  parent_chunk_id?: string | null
-  chunk_level?: string | null
-  source_title?: string | null
-  section_path?: string[] | null
-  page_start?: number | null
-  page_end?: number | null
-  block_type?: string | null
-  content?: string | null
-  question?: string | null
-  answer?: string | null
-  category?: string | null
-  tags?: string[] | null
-  metadata?: Record<string, unknown> | null
+  source_type: 'faq' | 'document'
+  source_chunk_id: string | null
+  parent_chunk_id: string | null
+  chunk_level: string
+  source_title: string | null
+  section_path: string[]
+  page_start: number | null
+  page_end: number | null
+  block_type: string | null
+  content: string
   channels: string[]
-  fused_score?: number
-  vector_score?: number | null
-  keyword_score?: number | null
-  [key: string]: unknown
+  fused_score: number
+  vector_score: number | null
+  keyword_score: number | null
+  kg_score: number | null
+  kg_matches: RetrievalKgFactMatch[]
 }
 
 export interface RetrievalEvalRun {
   id: string
   case_id: string
-  strategy: string
+  strategy: RetrievalEvalStrategyId
   retrieved_items: RetrievalEvalItem[]
   metrics: RetrievalEvalMetrics
   analysis: RetrievalEvalAnalysis
   created_at?: string
-  [key: string]: unknown
 }
 
-export interface RetrievalEvalCase {
+export interface RetrievalEvalCaseRecord {
   id: string
   question: string
   intent: string | null
@@ -303,10 +316,12 @@ export interface RetrievalEvalCase {
   tags: string[]
   note: string | null
   status: string
-  latest_run?: RetrievalEvalRun | null
   created_at?: string
   updated_at?: string
-  [key: string]: unknown
+}
+
+export interface RetrievalEvalCase extends RetrievalEvalCaseRecord {
+  latest_runs: RetrievalEvalRun[]
 }
 
 export interface RetrievalEvalCaseListResponse {
@@ -322,7 +337,6 @@ export interface RetrievalAlias {
   status: string
   created_at?: string
   updated_at?: string
-  [key: string]: unknown
 }
 
 export interface RetrievalAliasListResponse {
@@ -342,7 +356,7 @@ export interface KgEvidence {
   page_start: number | null
   page_end: number | null
   excerpt: string
-  [key: string]: unknown
+  is_valid: boolean
 }
 
 export interface KgEntity {
@@ -352,11 +366,13 @@ export interface KgEntity {
   aliases: string[]
   description: string | null
   status: string
+  review_revision: number
   confidence: number | null
   evidence: KgEvidence[]
+  has_valid_evidence: boolean
+  source_count: number
   created_at?: string
   updated_at?: string
-  [key: string]: unknown
 }
 
 export interface KgRelation {
@@ -366,15 +382,19 @@ export interface KgRelation {
   tail_entity_id: string
   description: string | null
   status: string
+  review_revision: number
   confidence: number | null
   head_entity_name: string
   head_entity_type: string
+  head_entity_status: string
   tail_entity_name: string
   tail_entity_type: string
+  tail_entity_status: string
   evidence: KgEvidence[]
+  has_valid_evidence: boolean
+  evidence_count: number
   created_at?: string
   updated_at?: string
-  [key: string]: unknown
 }
 
 export interface KgListResponse<T> {
@@ -387,7 +407,7 @@ export interface KgSubgraphNode {
   name: string
   entity_type: string
   description?: string | null
-  status?: string | null
+  status: 'usable'
   confidence?: number | null
 }
 
@@ -398,21 +418,23 @@ export interface KgSubgraphEdge {
   relation_type: string
   description?: string | null
   confidence?: number | null
-  status?: string | null
-  evidence_count?: number
+  status: 'usable'
+  evidence_count: number
 }
 
 export interface KgSubgraphResponse {
+  state: 'isolated' | 'connected'
+  center: KgSubgraphNode
   nodes: KgSubgraphNode[]
   edges: KgSubgraphEdge[]
 }
 
 export interface KgExtractionJob {
   id: string
-  source_type: string
+  source_type: 'faq' | 'document_chunk'
   source_id: string
   source_chunk_id?: string | null
-  status: string
+  status: 'queued' | 'processing' | 'completed' | 'failed'
   entity_count: number
   relation_count: number
   evidence_count: number
@@ -420,5 +442,4 @@ export interface KgExtractionJob {
   error?: string | null
   created_at?: string
   updated_at?: string
-  [key: string]: unknown
 }

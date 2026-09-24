@@ -27,8 +27,9 @@
 | [macos-permissions.md](./macos-permissions.md)     | macOS system permissions (mic, accessibility)     | Features requiring permissions     |
 | [text-input.md](./text-input.md)                   | Text insertion without clipboard pollution        | Voice-to-text, paste features      |
 | [cyclops-db-contracts.md](./cyclops-db-contracts.md) | Project-specific Python/PostgreSQL knowledge DB contracts | Modifying import, knowledge chunk, or RAG storage behavior |
-| [cyclops-document-parser-contracts.md](./cyclops-document-parser-contracts.md) | Project-specific MinerU/document parser contracts | Modifying MinerU payload normalization, evidence retention, or document chunk source fields |
+| [cyclops-document-parser-contracts.md](./cyclops-document-parser-contracts.md) | Project-specific MinerU/parser and persistent import-worker contracts | Modifying parse jobs, worker lifecycle, MinerU normalization, evidence retention, or document chunk source fields |
 | [cyclops-assistant-contracts.md](./cyclops-assistant-contracts.md) | Project-specific internal assistant stream and provenance contracts | Modifying assistant SSE, retrieval events, or source rendering |
+| [cyclops-retrieval-contracts.md](./cyclops-retrieval-contracts.md) | Project-specific canonical hybrid retrieval and evaluation v2 contracts | Modifying retrieval services, callers, parent context, KG debug, or evaluation run storage |
 | [cyclops-settings-contracts.md](./cyclops-settings-contracts.md) | Project-specific global settings and secret-preserving provider probe contracts | Modifying `/api/settings`, settings page, provider probe, or model-list behavior |
 | [cyclops-asgi-admin-contracts.md](./cyclops-asgi-admin-contracts.md) | Project-specific FastAPI/Uvicorn admin adapter and Cyclops CLI contracts | Modifying ASGI admin routes, static serving, admin CLI dispatch, SSE transport, or service wiring |
 
